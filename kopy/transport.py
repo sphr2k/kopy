@@ -13,7 +13,7 @@ from typing import Any
 from kubernetes.client import CoreV1Api
 from kubernetes.stream import portforward
 
-from .models import CopyRequest, PortForwardMode
+from .models import PortForwardMode
 
 
 class PortForwardError(RuntimeError):
@@ -21,21 +21,11 @@ class PortForwardError(RuntimeError):
 
 
 def build_rsync_command(
-    request: CopyRequest,
-    local_port: int,
+    source: str,
+    dest: str,
     rsync_bin: str,
-    module_name: str = "volume",
 ) -> list[str]:
-    destination = request.target.subpath.as_posix().strip(".")
-    suffix = f"/{destination}/" if destination else "/"
-    return [
-        rsync_bin,
-        "-a",
-        "--delete",
-        "--numeric-ids",
-        f"{request.source_dir}/",
-        f"rsync://127.0.0.1:{local_port}/{module_name}{suffix}",
-    ]
+    return [rsync_bin, "-a", "--delete", "--numeric-ids", source, dest]
 
 
 def open_port_forward(

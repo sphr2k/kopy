@@ -5,23 +5,23 @@ from pathlib import Path
 from typing import Literal
 
 
-TargetKind = Literal["pvc"]
+TargetKind = Literal["pvc", "local"]
 PortForwardMode = Literal["auto", "python", "kubectl"]
 
 
 @dataclass(frozen=True)
-class TargetRef:
+class Endpoint:
     kind: TargetKind
-    resource_name: str
-    subpath: Path
+    resource_name: str  # PVC name; empty for local
+    path: Path  # subpath within PVC mount, or local filesystem path
 
 
 @dataclass(frozen=True)
 class CopyRequest:
-    source_dir: Path
+    source: Endpoint
+    target: Endpoint
     context_name: str | None
     namespace: str | None
-    target: TargetRef
     uid: int | None
     gid: int | None
     keep_pod: bool
@@ -32,7 +32,7 @@ class CopyRequest:
 class DebugRequest:
     context_name: str | None
     namespace: str | None
-    target: TargetRef
+    target: Endpoint
     keep_pod: bool
     shell: str
 
@@ -41,8 +41,8 @@ class DebugRequest:
 class CopySession:
     pod_name: str
     namespace: str
-    local_port: int
-    rsync_port: int
+    local_port: int | None
+    rsync_port: int | None
     detected_uid: int | None
     detected_gid: int | None
     transport: str

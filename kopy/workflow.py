@@ -4,7 +4,7 @@ import random
 import string
 from pathlib import Path
 
-from .k8s import build_debug_pod_manifest, build_helper_pod_manifest
+from .k8s import build_debug_pod_manifest, build_dual_pvc_pod_manifest, build_helper_pod_manifest
 from .models import CopyRequest, CopySession, DebugRequest, DebugSession
 from .transport import build_rsync_command
 
@@ -87,6 +87,61 @@ def prepare_destination(
     kube.exec_in_pod(namespace, pod_name, ["sh", "-c", script])  # type: ignore[attr-defined]
 
 
+def _run_pvc_to_pvc(
+    request: CopyRequest,
+    kube: object,
+    helper_image: str,
+    rsync_bin: str,
+    pod_name_suffix: str | None,
+    on_pod_ready: object | None,
+) -> CopySession:
+    namespace = request.namespace
+    assert namespace
+    source = request.source
+    target = request.target
+    source_mount = "/kopy-source"
+    target_mount = "/kopy-target"
+
+    pod_name = build_helper_pod_name(
+        "p2p",
+        f"{source.resource_name}-{target.resource_name}",
+        suffix=pod_name_suffix,
+    )
+    manifest = build_dual_pvc_pod_manifest(
+        source_pvc=source.resource_name,
+        target_pvc=target.resource_name,
+        source_mount=source_mount,
+        target_mount=target_mount,
+        image=helper_image,
+        pod_name=pod_name,
+    )
+    kube.create_helper_pod(namespace, manifest)  # type: ignore[attr-defined]
+    try:
+        kube.wait_for_pod_ready(namespace, pod_name, timeout_seconds=30)  # type: ignore[attr-defined]
+        if on_pod_ready is not None:
+            on_pod_ready(pod_name)
+
+        src_subpath = source.path.as_posix()
+        dst_subpath = target.path.as_posix()
+        src = source_mount if src_subpath == "." else f"{source_mount}/{src_subpath}"
+        dst = target_mount if dst_subpath == "." else f"{target_mount}/{dst_subpath}"
+
+        kube.exec_in_pod(namespace, pod_name, [rsync_bin, "-a", "--delete", "--numeric-ids", f"{src}/", f"{dst}/"])  # type: ignore[attr-defined]
+
+        return CopySession(
+            pod_name=pod_name,
+            namespace=namespace,
+            local_port=None,
+            rsync_port=None,
+            detected_uid=None,
+            detected_gid=None,
+            transport="exec",
+        )
+    finally:
+        if not request.keep_pod:
+            kube.delete_pod(namespace, pod_name)  # type: ignore[attr-defined]
+
+
 def run_copy(
     request: CopyRequest,
     kube: object,
@@ -99,13 +154,32 @@ def run_copy(
     run_rsync: object,
     rsync_bin: str,
 ) -> CopySession:
+    source = request.source
+    target = request.target
     namespace = request.namespace
     if not namespace:
         raise ValueError("Copy request is missing a namespace")
 
-    pod_name = build_helper_pod_name("copy", request.target.resource_name, suffix=pod_name_suffix)
+    if source.kind == "local" and target.kind == "local":
+        raise ValueError("Both endpoints are local — use cp or rsync directly")
+
+    if source.kind == "pvc" and target.kind == "pvc":
+        return _run_pvc_to_pvc(
+            request=request,
+            kube=kube,
+            helper_image=helper_image,
+            rsync_bin=rsync_bin,
+            pod_name_suffix=pod_name_suffix,
+            on_pod_ready=on_pod_ready,
+        )
+
+    # One local, one pvc
+    pvc_ep = target if target.kind == "pvc" else source
+    is_upload = source.kind == "local"
+
+    pod_name = build_helper_pod_name("copy", pvc_ep.resource_name, suffix=pod_name_suffix)
     manifest = build_helper_pod_manifest(
-        request=request,
+        pvc_endpoint=pvc_ep,
         pod_name=pod_name,
         image=helper_image,
         rsync_port=rsync_port,
@@ -116,37 +190,45 @@ def run_copy(
         kube.wait_for_pod_ready(namespace, pod_name, timeout_seconds=30)  # type: ignore[attr-defined]
         if on_pod_ready is not None:
             on_pod_ready(pod_name)
-        if request.uid is not None and request.gid is not None:
-            uid, gid = request.uid, request.gid
-        else:
-            uid, gid = detect_destination_ownership(
+
+        if is_upload:
+            if request.uid is not None and request.gid is not None:
+                uid, gid = request.uid, request.gid
+            else:
+                uid, gid = detect_destination_ownership(
+                    kube=kube,
+                    namespace=namespace,
+                    pod_name=pod_name,
+                    mount_path=helper_mount_path,
+                    subpath=target.path,
+                )
+            prepare_destination(
                 kube=kube,
                 namespace=namespace,
                 pod_name=pod_name,
                 mount_path=helper_mount_path,
-                subpath=request.target.subpath,
+                subpath=target.path,
+                uid=uid,
+                gid=gid,
             )
-        prepare_destination(
-            kube=kube,
-            namespace=namespace,
-            pod_name=pod_name,
-            mount_path=helper_mount_path,
-            subpath=request.target.subpath,
-            uid=uid,
-            gid=gid,
-        )
-        with open_transport(
-            request.port_forward_mode,
-            namespace,
-            pod_name,
-            rsync_port,
-        ) as (transport_name, local_port):
-            command = build_rsync_command(
-                request=request,
-                local_port=local_port,
-                rsync_bin=rsync_bin,
-            )
-            run_rsync(command)
+        else:
+            uid, gid = request.uid, request.gid
+            target.path.mkdir(parents=True, exist_ok=True)
+
+        subpath_str = pvc_ep.path.as_posix()
+        suffix = f"/{subpath_str}/" if subpath_str != "." else "/"
+
+        with open_transport(request.port_forward_mode, namespace, pod_name, rsync_port) as (transport_name, local_port):  # type: ignore[attr-defined]
+            rsync_url = f"rsync://127.0.0.1:{local_port}/volume{suffix}"
+            if is_upload:
+                rsync_src = f"{source.path}/"
+                rsync_dst = rsync_url
+            else:
+                rsync_src = rsync_url
+                rsync_dst = f"{target.path}/"
+
+            command = build_rsync_command(source=rsync_src, dest=rsync_dst, rsync_bin=rsync_bin)
+            run_rsync(command)  # type: ignore[operator]
             return CopySession(
                 pod_name=pod_name,
                 namespace=namespace,
@@ -177,7 +259,7 @@ def run_debug_session(
 
     pod_name = build_helper_pod_name("debug", request.target.resource_name, suffix=pod_name_suffix)
     manifest = build_debug_pod_manifest(
-        request=request,
+        pvc_endpoint=request.target,
         pod_name=pod_name,
         image=helper_image,
         mount_path=helper_mount_path,

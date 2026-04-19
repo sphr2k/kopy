@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 from pathlib import Path
 
-from kopy.models import CopyRequest, TargetRef
+from kopy.models import CopyRequest, Endpoint
 from kopy.workflow import run_copy
 
 
@@ -44,10 +44,10 @@ class FakeTransport:
 
 def make_request(keep_pod: bool = False, uid: int | None = None, gid: int | None = None) -> CopyRequest:
     return CopyRequest(
-        source_dir=Path("/tmp/source"),
+        source=Endpoint(kind="local", resource_name="", path=Path("/tmp/source")),
+        target=Endpoint(kind="pvc", resource_name="media", path=Path("uploads")),
         context_name="ctx",
         namespace="demo",
-        target=TargetRef(kind="pvc", resource_name="media", subpath=Path("uploads")),
         uid=uid,
         gid=gid,
         keep_pod=keep_pod,
@@ -132,3 +132,78 @@ def test_run_copy_keeps_pod_when_requested() -> None:
     )
 
     assert kube.deleted == []
+
+
+def test_run_copy_download_reverses_rsync_direction() -> None:
+    kube = FakeKubeClient()
+    transport = FakeTransport()
+    rsync_commands: list[list[str]] = []
+
+    request = CopyRequest(
+        source=Endpoint(kind="pvc", resource_name="media", path=Path("uploads")),
+        target=Endpoint(kind="local", resource_name="", path=Path("/tmp/dest")),
+        context_name="ctx",
+        namespace="demo",
+        uid=None,
+        gid=None,
+        keep_pod=False,
+        port_forward_mode="auto",
+    )
+
+    run_copy(
+        request=request,
+        kube=kube,
+        helper_image="ghcr.io/example/kopy-agent:latest",
+        helper_mount_path="/data",
+        rsync_port=1873,
+        pod_name_suffix="abcde",
+        on_pod_ready=None,
+        open_transport=transport.open,
+        run_rsync=lambda command: rsync_commands.append(command),
+        rsync_bin="rsync",
+    )
+
+    assert rsync_commands == [
+        [
+            "rsync",
+            "-a",
+            "--delete",
+            "--numeric-ids",
+            "rsync://127.0.0.1:1873/volume/uploads/",
+            "/tmp/dest/",
+        ]
+    ]
+
+
+def test_run_copy_pvc_to_pvc_uses_exec() -> None:
+    kube = FakeKubeClient()
+    transport = FakeTransport()
+
+    request = CopyRequest(
+        source=Endpoint(kind="pvc", resource_name="source-pvc", path=Path(".")),
+        target=Endpoint(kind="pvc", resource_name="target-pvc", path=Path(".")),
+        context_name="ctx",
+        namespace="demo",
+        uid=None,
+        gid=None,
+        keep_pod=False,
+        port_forward_mode="auto",
+    )
+
+    session = run_copy(
+        request=request,
+        kube=kube,
+        helper_image="ghcr.io/example/kopy-agent:latest",
+        helper_mount_path="/data",
+        rsync_port=1873,
+        pod_name_suffix="abcde",
+        on_pod_ready=None,
+        open_transport=transport.open,
+        run_rsync=lambda command: None,
+        rsync_bin="rsync",
+    )
+
+    assert session.transport == "exec"
+    assert session.local_port is None
+    assert transport.opened == []  # no port-forward for pvc→pvc
+    assert any("rsync" in " ".join(call[2].split()) for call in kube.exec_calls)

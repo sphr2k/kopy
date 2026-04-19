@@ -8,17 +8,17 @@ from typing import Any, cast
 from kubernetes import client, config
 from kubernetes.stream import stream
 
-from .models import CopyRequest, DebugRequest
+from .models import DebugRequest, Endpoint
 
 
 def build_helper_pod_manifest(
-    request: CopyRequest,
+    pvc_endpoint: Endpoint,
     pod_name: str,
     image: str,
     rsync_port: int,
     mount_path: str = "/data",
 ) -> dict[str, Any]:
-    destination_subpath = request.target.subpath.as_posix()
+    destination_subpath = pvc_endpoint.path.as_posix()
     shell_command = f"""
 set -eu
 mkdir -p /tmp/kopy
@@ -67,7 +67,7 @@ exec rsync --daemon --no-detach --config=/tmp/kopy/rsyncd.conf --port={rsync_por
             "volumes": [
                 {
                     "name": "target-volume",
-                    "persistentVolumeClaim": {"claimName": request.target.resource_name},
+                    "persistentVolumeClaim": {"claimName": pvc_endpoint.resource_name},
                 }
             ],
         },
@@ -75,12 +75,12 @@ exec rsync --daemon --no-detach --config=/tmp/kopy/rsyncd.conf --port={rsync_por
 
 
 def build_debug_pod_manifest(
-    request: DebugRequest,
+    pvc_endpoint: Endpoint,
     pod_name: str,
     image: str,
     mount_path: str = "/data",
 ) -> dict[str, Any]:
-    destination_subpath = request.target.subpath.as_posix()
+    destination_subpath = pvc_endpoint.path.as_posix()
     prepare_path = mount_path if destination_subpath == "." else f"{mount_path}/{destination_subpath}"
     shell_command = f"mkdir -p {prepare_path} && exec sleep infinity"
 
@@ -115,8 +115,58 @@ def build_debug_pod_manifest(
             "volumes": [
                 {
                     "name": "target-volume",
-                    "persistentVolumeClaim": {"claimName": request.target.resource_name},
+                    "persistentVolumeClaim": {"claimName": pvc_endpoint.resource_name},
                 }
+            ],
+        },
+    }
+
+
+def build_dual_pvc_pod_manifest(
+    source_pvc: str,
+    target_pvc: str,
+    source_mount: str,
+    target_mount: str,
+    image: str,
+    pod_name: str,
+) -> dict[str, Any]:
+    shell_command = f"mkdir -p {source_mount} {target_mount} && exec sleep infinity"
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name,
+            "labels": {
+                "app.kubernetes.io/name": "kopy",
+                "app.kubernetes.io/component": "pvc-copy-helper",
+            },
+        },
+        "spec": {
+            "restartPolicy": "Never",
+            "containers": [
+                {
+                    "name": "copy-agent",
+                    "image": image,
+                    "command": ["sh", "-c", shell_command],
+                    "securityContext": {
+                        "runAsUser": 0,
+                        "runAsGroup": 0,
+                    },
+                    "volumeMounts": [
+                        {"name": "source-volume", "mountPath": source_mount},
+                        {"name": "target-volume", "mountPath": target_mount},
+                    ],
+                }
+            ],
+            "volumes": [
+                {
+                    "name": "source-volume",
+                    "persistentVolumeClaim": {"claimName": source_pvc},
+                },
+                {
+                    "name": "target-volume",
+                    "persistentVolumeClaim": {"claimName": target_pvc},
+                },
             ],
         },
     }

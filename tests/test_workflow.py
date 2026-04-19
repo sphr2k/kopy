@@ -1,16 +1,16 @@
 from pathlib import Path
 
 from kopy.k8s import build_helper_pod_manifest
-from kopy.models import CopyRequest, TargetRef
+from kopy.models import CopyRequest, Endpoint
 from kopy.workflow import resolve_destination_ownership
 
 
 def make_request(subpath: str = ".") -> CopyRequest:
     return CopyRequest(
-        source_dir=Path("/tmp/source"),
+        source=Endpoint(kind="local", resource_name="", path=Path("/tmp/source")),
+        target=Endpoint(kind="pvc", resource_name="media", path=Path(subpath)),
         context_name="ctx",
         namespace="demo",
-        target=TargetRef(kind="pvc", resource_name="media", subpath=Path(subpath)),
         uid=None,
         gid=None,
         keep_pod=False,
@@ -19,8 +19,9 @@ def make_request(subpath: str = ".") -> CopyRequest:
 
 
 def test_helper_pod_manifest_mounts_requested_pvc_and_subpath() -> None:
+    request = make_request("uploads/2026-04")
     manifest = build_helper_pod_manifest(
-        request=make_request("uploads/2026-04"),
+        pvc_endpoint=request.target,
         pod_name="kopy-copy-123",
         image="ghcr.io/example/kopy-agent:latest",
         rsync_port=1873,

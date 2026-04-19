@@ -8,9 +8,9 @@ from clypi import ClypiConfig, Command, Spin, Spinner, Styler, Theme, arg, confi
 from rich.panel import Panel
 
 from .k8s import KubeClient
-from .models import CopyRequest, DebugRequest, PortForwardMode, TargetRef
+from .models import CopyRequest, DebugRequest, Endpoint, PortForwardMode
 from .settings import settings
-from .target import parse_target
+from .target import parse_endpoint
 from .transport import open_transport_session, run_interactive_command, run_rsync_command
 from .ui import console, pick_with_fzf
 from .workflow import run_copy, run_debug_session
@@ -35,39 +35,45 @@ configure(
 )
 
 
-def format_target_uri(target: TargetRef) -> str:
-    if target.subpath == Path("."):
-        return f"{target.kind}://{target.resource_name}"
-    return f"{target.kind}://{target.resource_name}/{target.subpath.as_posix()}"
+def format_endpoint(endpoint: Endpoint) -> str:
+    if endpoint.kind == "local":
+        return str(endpoint.path)
+    if endpoint.path == Path("."):
+        return f"pvc://{endpoint.resource_name}"
+    return f"pvc://{endpoint.resource_name}/{endpoint.path.as_posix()}"
 
 
-def format_mount_destination(target: TargetRef) -> str:
-    if target.subpath == Path("."):
+def format_mount_destination(target: Endpoint) -> str:
+    if target.path == Path("."):
         return settings.helper_mount_path
-    return f"{settings.helper_mount_path}/{target.subpath.as_posix()}"
+    return f"{settings.helper_mount_path}/{target.path.as_posix()}"
 
 
-def print_mount_info(pod_name: str, target: TargetRef) -> None:
+def print_mount_info(pod_name: str, target: Endpoint) -> None:
     console.print(
         Panel.fit(
-            f"Pod: {pod_name}\nTarget: {format_target_uri(target)}\nMounted at: {settings.helper_mount_path}",
+            f"Pod: {pod_name}\nTarget: {format_endpoint(target)}\nMounted at: {settings.helper_mount_path}",
             title="Mount Info",
             border_style="cyan",
         )
     )
 
 
-def print_copy_info(source_dir: Path, pod_name: str, target: TargetRef) -> None:
+def print_copy_info(source: Endpoint, pod_name: str, target: Endpoint) -> None:
     console.print(
         Panel.fit(
             "\n".join(
                 [
-                    f"Source: {source_dir}",
-                    f"Target: {format_target_uri(target)}",
+                    f"Source: {format_endpoint(source)}",
+                    f"Target: {format_endpoint(target)}",
                     f"Pod: {pod_name}",
                     f"Mounted at: {settings.helper_mount_path}",
-                    f"Destination in pod: {format_mount_destination(target)}",
                 ]
+                + (
+                    [f"Destination in pod: {format_mount_destination(target)}"]
+                    if target.kind == "pvc"
+                    else []
+                )
             ),
             title="Copy Info",
             border_style="cyan",
@@ -76,7 +82,7 @@ def print_copy_info(source_dir: Path, pod_name: str, target: TargetRef) -> None:
 
 
 def build_copy_request(
-    source_dir: Path,
+    raw_source: str,
     raw_target: str,
     context_name: str | None,
     namespace: str | None,
@@ -86,10 +92,10 @@ def build_copy_request(
     port_forward_mode: PortForwardMode,
 ) -> CopyRequest:
     return CopyRequest(
-        source_dir=source_dir,
+        source=parse_endpoint(raw_source),
+        target=parse_endpoint(raw_target),
         context_name=context_name,
         namespace=namespace,
-        target=parse_target(raw_target),
         uid=uid,
         gid=gid,
         keep_pod=keep_pod,
@@ -107,24 +113,24 @@ def build_debug_request(
     return DebugRequest(
         context_name=context_name,
         namespace=namespace,
-        target=parse_target(raw_target),
+        target=parse_endpoint(raw_target),
         keep_pod=keep_pod,
         shell=shell,
     )
 
 
-def resolve_target(
+def resolve_endpoint(
     client: KubeClient | object,
     namespace: str,
-    target: TargetRef,
+    endpoint: Endpoint,
     interactive: bool,
     picker: Callable[[list[str], str, bool], list[str]] = pick_with_fzf,
-) -> TargetRef:
-    if target.resource_name:
-        return target
+) -> Endpoint:
+    if endpoint.kind != "pvc" or endpoint.resource_name:
+        return endpoint
 
     if not interactive:
-        raise ValueError("Target PVC name is missing and interactive selection is disabled")
+        raise ValueError("PVC name is missing and interactive selection is disabled")
 
     pvc_names = client.list_pvcs(namespace)  # type: ignore[attr-defined]
     if not pvc_names:
@@ -134,14 +140,14 @@ def resolve_target(
     if not selected:
         raise ValueError("No PVC selected")
 
-    return TargetRef(kind=target.kind, resource_name=selected[0], subpath=target.subpath)
+    return Endpoint(kind="pvc", resource_name=selected[0], path=endpoint.path)
 
 
 class Copy(Command):
-    """Copy a local directory into a Kubernetes PVC target."""
+    """Copy between local paths and Kubernetes PVCs."""
 
-    source_dir: Path = arg(help="Local source directory to copy")
-    target: str = arg(help="Typed target URI, e.g. pvc://media/uploads")
+    source: str = arg(help="Source: local path or pvc://name/subpath")
+    target: str = arg(help="Target: local path or pvc://name/subpath")
     context: str | None = arg(default=None, help="Kubernetes context name")
     namespace: str | None = arg(default=None, help="Kubernetes namespace")
     uid: int | None = arg(default=None, help="Override destination UID")
@@ -155,7 +161,7 @@ class Copy(Command):
 
     async def run(self) -> None:
         request = build_copy_request(
-            source_dir=self.source_dir,
+            raw_source=self.source,
             raw_target=self.target,
             context_name=self.context,
             namespace=self.namespace,
@@ -164,8 +170,8 @@ class Copy(Command):
             keep_pod=self.keep_pod,
             port_forward_mode=self.port_forward_mode,
         )
-        if not request.source_dir.is_dir():
-            raise ValueError(f"Source directory does not exist: {request.source_dir}")
+        if request.source.kind == "local" and not request.source.path.is_dir():
+            raise ValueError(f"Source directory does not exist: {request.source.path}")
 
         kube = KubeClient(context_name=request.context_name)
         namespace = request.namespace or kube.current_namespace()
@@ -173,22 +179,27 @@ class Copy(Command):
             raise ValueError("Namespace is required. Pass --namespace or configure one in kubeconfig.")
 
         request = CopyRequest(
-            source_dir=request.source_dir,
-            context_name=request.context_name,
-            namespace=namespace,
-            target=resolve_target(
+            source=resolve_endpoint(
                 client=kube,
                 namespace=namespace,
-                target=request.target,
+                endpoint=request.source,
                 interactive=not self.no_fzf,
             ),
+            target=resolve_endpoint(
+                client=kube,
+                namespace=namespace,
+                endpoint=request.target,
+                interactive=not self.no_fzf,
+            ),
+            context_name=request.context_name,
+            namespace=namespace,
             uid=request.uid,
             gid=request.gid,
             keep_pod=request.keep_pod,
             port_forward_mode=request.port_forward_mode,
         )
         async with Spinner(
-            title=f"Copying into {format_target_uri(request.target)}",
+            title=f"Copying {format_endpoint(request.source)} → {format_endpoint(request.target)}",
             animation=Spin.DOTS,
             prefix=" ",
             suffix="...",
@@ -201,7 +212,7 @@ class Copy(Command):
                 helper_mount_path=settings.helper_mount_path,
                 rsync_port=settings.helper_rsync_port,
                 pod_name_suffix=None,
-                on_pod_ready=lambda pod_name: print_copy_info(request.source_dir, pod_name, request.target),
+                on_pod_ready=lambda pod_name: print_copy_info(request.source, pod_name, request.target),
                 open_transport=lambda mode, namespace, pod_name, remote_port: open_transport_session(
                     mode=mode,
                     core_api=kube._core_api,
@@ -213,11 +224,11 @@ class Copy(Command):
                 run_rsync=run_rsync_command,
                 rsync_bin=settings.rsync_bin,
             )
+        port_info = f" via {session.transport} port-forward on localhost:{session.local_port}" if session.local_port else ""
         console.print(
             "[green]"
-            f"Copied {request.source_dir} to {format_target_uri(request.target)} "
-            f"via {session.transport} port-forward on localhost:{session.local_port}. "
-            f"Mounted at {settings.helper_mount_path} in pod {session.pod_name}"
+            f"Copied {format_endpoint(request.source)} to {format_endpoint(request.target)}"
+            f"{port_info} in pod {session.pod_name}"
             "[/green]"
         )
 
@@ -249,10 +260,10 @@ class Debug(Command):
         request = DebugRequest(
             context_name=request.context_name,
             namespace=namespace,
-            target=resolve_target(
+            target=resolve_endpoint(
                 client=kube,
                 namespace=namespace,
-                target=request.target,
+                endpoint=request.target,
                 interactive=not self.no_fzf,
             ),
             keep_pod=request.keep_pod,
@@ -260,7 +271,7 @@ class Debug(Command):
         )
 
         async with Spinner(
-            title=f"Attaching debug shell to {format_target_uri(request.target)}",
+            title=f"Attaching debug shell to {format_endpoint(request.target)}",
             animation=Spin.DOTS,
             prefix=" ",
             suffix="...",
@@ -278,28 +289,24 @@ class Debug(Command):
             )
         console.print(
             "[green]"
-            f"Debug shell finished for {format_target_uri(request.target)} "
+            f"Debug shell finished for {format_endpoint(request.target)} "
             f"on pod {session.pod_name} mounted at {settings.helper_mount_path}"
             "[/green]"
         )
 
 
 def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] in {"copy", "debug"}:
-        command_name = sys.argv[1]
+    if len(sys.argv) > 1 and sys.argv[1] == "debug":
         raw_args = sys.argv[2:]
-        if command_name == "copy" and raw_args and not raw_args[0].startswith("-"):
-            if len(raw_args) < 2 or raw_args[1].startswith("-"):
-                raise SystemExit("copy expects SOURCE_DIR and TARGET")
-            raw_args = ["--source-dir", raw_args[0], "--target", raw_args[1], *raw_args[2:]]
-        if command_name == "debug" and raw_args and not raw_args[0].startswith("-"):
+        if raw_args and not raw_args[0].startswith("-"):
             raw_args = ["--target", raw_args[0], *raw_args[1:]]
-        parser = Copy if command_name == "copy" else Debug
-        command = parser.parse(raw_args)
-        error = command.start()
-        if error:
-            raise SystemExit(str(error))
-        return
-
-    console.print(f"[red]Unknown command. Try: {Path(sys.argv[0]).name} copy --help or {Path(sys.argv[0]).name} debug --help[/red]")
-    raise SystemExit(2)
+        command = Debug.parse(raw_args)
+    else:
+        raw_args = sys.argv[1:]
+        # positional shorthand: kopy ./src pvc://dest  →  --source ./src --target pvc://dest
+        if len(raw_args) >= 2 and not raw_args[0].startswith("-") and not raw_args[1].startswith("-"):
+            raw_args = ["--source", raw_args[0], "--target", raw_args[1], *raw_args[2:]]
+        command = Copy.parse(raw_args)
+    error = command.start()
+    if error:
+        raise SystemExit(str(error))

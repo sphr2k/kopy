@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from kopy.models import DebugRequest, TargetRef
+from kopy.models import DebugRequest, Endpoint
 from kopy.workflow import run_debug_session
 
 
@@ -25,7 +25,7 @@ def make_request(keep_pod: bool = False) -> DebugRequest:
     return DebugRequest(
         context_name="ctx",
         namespace="plex",
-        target=TargetRef(kind="pvc", resource_name="plex-config", subpath=Path("debug")),
+        target=Endpoint(kind="pvc", resource_name="plex-config", path=Path("debug")),
         keep_pod=keep_pod,
         shell="sh",
     )

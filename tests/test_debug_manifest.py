@@ -1,18 +1,12 @@
 from pathlib import Path
 
 from kopy.k8s import build_debug_pod_manifest
-from kopy.models import DebugRequest, TargetRef
+from kopy.models import Endpoint
 
 
 def test_debug_pod_manifest_mounts_requested_pvc_and_sleeps() -> None:
     manifest = build_debug_pod_manifest(
-        request=DebugRequest(
-            context_name="ctx",
-            namespace="plex",
-            target=TargetRef(kind="pvc", resource_name="plex-config", subpath=Path("debug")),
-            keep_pod=False,
-            shell="sh",
-        ),
+        pvc_endpoint=Endpoint(kind="pvc", resource_name="plex-config", path=Path("debug")),
         pod_name="kopy-debug-123",
         image="ghcr.io/example/kopy-agent:latest",
     )

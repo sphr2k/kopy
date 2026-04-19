@@ -1,6 +1,3 @@
-from pathlib import Path
-
-from kopy.models import CopyRequest, TargetRef
 from kopy.transport import (
     PortForwardError,
     build_rsync_command,
@@ -8,25 +5,11 @@ from kopy.transport import (
 )
 
 
-def make_request() -> CopyRequest:
-    return CopyRequest(
-        source_dir=Path("/tmp/source"),
-        context_name="ctx",
-        namespace="demo",
-        target=TargetRef(kind="pvc", resource_name="media", subpath=Path("uploads")),
-        uid=1000,
-        gid=1000,
-        keep_pod=False,
-        port_forward_mode="auto",
-    )
-
-
-def test_build_rsync_command_targets_forwarded_module_path() -> None:
+def test_build_rsync_command_upload() -> None:
     command = build_rsync_command(
-        request=make_request(),
-        local_port=1873,
+        source="/tmp/source/",
+        dest="rsync://127.0.0.1:1873/volume/uploads/",
         rsync_bin="rsync",
-        module_name="volume",
     )
 
     assert command == [
@@ -36,6 +19,23 @@ def test_build_rsync_command_targets_forwarded_module_path() -> None:
         "--numeric-ids",
         "/tmp/source/",
         "rsync://127.0.0.1:1873/volume/uploads/",
+    ]
+
+
+def test_build_rsync_command_download() -> None:
+    command = build_rsync_command(
+        source="rsync://127.0.0.1:1873/volume/uploads/",
+        dest="/tmp/dest/",
+        rsync_bin="rsync",
+    )
+
+    assert command == [
+        "rsync",
+        "-a",
+        "--delete",
+        "--numeric-ids",
+        "rsync://127.0.0.1:1873/volume/uploads/",
+        "/tmp/dest/",
     ]
 
 
