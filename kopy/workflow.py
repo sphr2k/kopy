@@ -4,8 +4,8 @@ import random
 import string
 from pathlib import Path
 
-from .k8s import build_debug_pod_manifest, build_dual_pvc_pod_manifest, build_helper_pod_manifest
-from .models import CopyRequest, CopySession, DebugRequest, DebugSession
+from .k8s import build_debug_pod_manifest, build_dual_pvc_pod_manifest, build_helper_pod_manifest, build_pvc_manifest
+from .models import CopyRequest, CopySession, DebugRequest, DebugSession, TakeoverRequest, TakeoverSession
 from .transport import build_rsync_command
 
 
@@ -87,6 +87,131 @@ def prepare_destination(
     kube.exec_in_pod(namespace, pod_name, ["sh", "-c", script])  # type: ignore[attr-defined]
 
 
+def ensure_target_pvc(
+    request: CopyRequest,
+    kube: object,
+) -> None:
+    if request.target.kind != "pvc":
+        return
+
+    namespace = request.namespace
+    assert namespace
+    existing = kube.get_pvc(namespace, request.target.resource_name)  # type: ignore[attr-defined]
+    if existing is not None:
+        return
+
+    if not request.create_pvc:
+        raise ValueError(f"Target PVC {namespace}/{request.target.resource_name} does not exist")
+    if request.source.kind != "pvc":
+        raise ValueError("Target PVC creation currently requires a PVC source to copy access modes and size")
+
+    source_pvc = kube.get_pvc(namespace, request.source.resource_name)  # type: ignore[attr-defined]
+    if source_pvc is None:
+        raise ValueError(f"Source PVC {namespace}/{request.source.resource_name} does not exist")
+
+    source_spec = source_pvc.get("spec", {})
+    access_modes = source_spec.get("accessModes")
+    requested_storage = source_spec.get("resources", {}).get("requests", {}).get("storage")
+    if not access_modes or not requested_storage:
+        raise ValueError(
+            f"Source PVC {namespace}/{request.source.resource_name} is missing access modes or requested storage"
+        )
+
+    manifest = build_pvc_manifest(
+        pvc_name=request.target.resource_name,
+        access_modes=access_modes,
+        requested_storage=requested_storage,
+        storage_class_name=request.storage_class,
+    )
+    kube.create_pvc(namespace, manifest)  # type: ignore[attr-defined]
+
+
+def _require_root_pvc_endpoint(endpoint: object, role: str) -> None:
+    resource_name = endpoint.resource_name  # type: ignore[attr-defined]
+    path = endpoint.path  # type: ignore[attr-defined]
+    kind = endpoint.kind  # type: ignore[attr-defined]
+    if kind != "pvc" or path != Path("."):
+        raise ValueError(f"{role} must be a PVC root endpoint like pvc://{resource_name or '<name>'}")
+
+
+def _update_reclaim_policy(kube: object, pv_name: str, reclaim_policy: str) -> None:
+    kube.patch_pv(pv_name, {"spec": {"persistentVolumeReclaimPolicy": reclaim_policy}})  # type: ignore[attr-defined]
+
+
+def run_takeover(
+    request: TakeoverRequest,
+    kube: object,
+) -> TakeoverSession:
+    namespace = request.namespace
+    if not namespace:
+        raise ValueError("Takeover request is missing a namespace")
+
+    _require_root_pvc_endpoint(request.source, "Source")
+    _require_root_pvc_endpoint(request.target, "Target")
+
+    source_pvc = kube.get_pvc(namespace, request.source.resource_name)  # type: ignore[attr-defined]
+    target_pvc = kube.get_pvc(namespace, request.target.resource_name)  # type: ignore[attr-defined]
+    if source_pvc is None:
+        raise ValueError(f"Source PVC {namespace}/{request.source.resource_name} does not exist")
+    if target_pvc is None:
+        raise ValueError(f"Target PVC {namespace}/{request.target.resource_name} does not exist")
+
+    source_spec = source_pvc.get("spec", {})
+    target_spec = target_pvc.get("spec", {})
+    source_pv_name = source_spec.get("volumeName")
+    target_pv_name = target_spec.get("volumeName")
+    if not source_pv_name or not target_pv_name:
+        raise ValueError("Both PVCs must already be bound to PVs before takeover")
+
+    source_pv = kube.get_pv(source_pv_name)  # type: ignore[attr-defined]
+    target_pv = kube.get_pv(target_pv_name)  # type: ignore[attr-defined]
+    reclaim_policies = {
+        source_pv_name: source_pv.get("spec", {}).get("persistentVolumeReclaimPolicy"),
+        target_pv_name: target_pv.get("spec", {}).get("persistentVolumeReclaimPolicy"),
+    }
+    patched_pvs: list[tuple[str, str]] = []
+    for pv_name, reclaim_policy in reclaim_policies.items():
+        if reclaim_policy == "Retain":
+            continue
+        if not request.set_retain:
+            raise ValueError(
+                f"PV {pv_name} must use Retain reclaim policy before takeover to avoid data loss"
+            )
+        _update_reclaim_policy(kube, pv_name, "Retain")
+        patched_pvs.append((pv_name, reclaim_policy))
+
+    try:
+        kube.delete_pvc(namespace, request.target.resource_name)  # type: ignore[attr-defined]
+        kube.delete_pvc(namespace, request.source.resource_name)  # type: ignore[attr-defined]
+        kube.patch_pv(  # type: ignore[attr-defined]
+            source_pv_name,
+            {
+                "metadata": {
+                    "annotations": {
+                        "pv.kubernetes.io/bind-completed": None,
+                        "pv.kubernetes.io/bound-by-controller": None,
+                    }
+                },
+                "spec": {"claimRef": None},
+            },
+        )
+        manifest = build_pvc_manifest(
+            pvc_name=request.target.resource_name,
+            access_modes=source_spec.get("accessModes", []),
+            requested_storage=source_spec.get("resources", {}).get("requests", {}).get("storage"),
+            storage_class_name=source_spec.get("storageClassName"),
+            volume_name=source_pv_name,
+            volume_mode=source_spec.get("volumeMode"),
+        )
+        kube.create_pvc(namespace, manifest)  # type: ignore[attr-defined]
+        if hasattr(kube, "wait_for_pvc_bound"):
+            kube.wait_for_pvc_bound(namespace, request.target.resource_name, source_pv_name)  # type: ignore[attr-defined]
+        return TakeoverSession(namespace=namespace, pvc_name=request.target.resource_name, pv_name=source_pv_name)
+    finally:
+        for pv_name, original_policy in patched_pvs:
+            _update_reclaim_policy(kube, pv_name, original_policy)
+
+
 def _run_pvc_to_pvc(
     request: CopyRequest,
     kube: object,
@@ -107,6 +232,9 @@ def _run_pvc_to_pvc(
         f"{source.resource_name}-{target.resource_name}",
         suffix=pod_name_suffix,
     )
+    source_node = kube.get_pvc_bound_node(namespace, source.resource_name)  # type: ignore[attr-defined]
+    if source_node:
+        kube.ensure_pvc_bound(namespace, target.resource_name, selected_node=source_node)  # type: ignore[attr-defined]
     manifest = build_dual_pvc_pod_manifest(
         source_pvc=source.resource_name,
         target_pvc=target.resource_name,
@@ -162,6 +290,9 @@ def run_copy(
 
     if source.kind == "local" and target.kind == "local":
         raise ValueError("Both endpoints are local — use cp or rsync directly")
+
+    if target.kind == "pvc":
+        ensure_target_pvc(request, kube)
 
     if source.kind == "pvc" and target.kind == "pvc":
         return _run_pvc_to_pvc(

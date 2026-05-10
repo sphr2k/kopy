@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from kopy.k8s import build_helper_pod_manifest
+from kopy.k8s import build_helper_pod_manifest, build_pvc_manifest
 from kopy.models import CopyRequest, Endpoint
 from kopy.workflow import resolve_destination_ownership
 
@@ -15,6 +15,8 @@ def make_request(subpath: str = ".") -> CopyRequest:
         gid=None,
         keep_pod=False,
         port_forward_mode="auto",
+        create_pvc=False,
+        storage_class=None,
     )
 
 
@@ -31,6 +33,34 @@ def test_helper_pod_manifest_mounts_requested_pvc_and_subpath() -> None:
     assert manifest["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"] == "media"
     assert container["securityContext"]["runAsUser"] == 0
     assert container["env"][-1] == {"name": "KOPY_DESTINATION_SUBPATH", "value": "uploads/2026-04"}
+    assert manifest["spec"]["tolerations"] == [{"operator": "Exists"}]
+
+
+def test_build_pvc_manifest_uses_source_shape_and_explicit_storage_class() -> None:
+    manifest = build_pvc_manifest(
+        pvc_name="media-migrated",
+        access_modes=["ReadWriteOnce"],
+        requested_storage="50Gi",
+        storage_class_name="fast-ssd",
+    )
+
+    assert manifest["metadata"]["name"] == "media-migrated"
+    assert manifest["spec"]["accessModes"] == ["ReadWriteOnce"]
+    assert manifest["spec"]["resources"]["requests"]["storage"] == "50Gi"
+    assert manifest["spec"]["storageClassName"] == "fast-ssd"
+
+
+def test_build_pvc_manifest_omits_storage_class_when_unspecified() -> None:
+    manifest = build_pvc_manifest(
+        pvc_name="media-migrated",
+        access_modes=["ReadWriteMany"],
+        requested_storage="200Gi",
+        storage_class_name=None,
+    )
+
+    assert manifest["spec"]["accessModes"] == ["ReadWriteMany"]
+    assert manifest["spec"]["resources"]["requests"]["storage"] == "200Gi"
+    assert "storageClassName" not in manifest["spec"]
 
 
 def test_resolve_destination_ownership_prefers_existing_subpath() -> None:

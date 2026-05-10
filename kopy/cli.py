@@ -8,12 +8,12 @@ from clypi import ClypiConfig, Command, Spin, Spinner, Styler, Theme, arg, confi
 from rich.panel import Panel
 
 from .k8s import KubeClient
-from .models import CopyRequest, DebugRequest, Endpoint, PortForwardMode
+from .models import CopyRequest, DebugRequest, Endpoint, PortForwardMode, TakeoverRequest
 from .settings import settings
 from .target import parse_endpoint
 from .transport import open_transport_session, run_interactive_command, run_rsync_command
 from .ui import console, pick_with_fzf
-from .workflow import run_copy, run_debug_session
+from .workflow import run_copy, run_debug_session, run_takeover
 
 
 configure(
@@ -90,6 +90,8 @@ def build_copy_request(
     gid: int | None,
     keep_pod: bool,
     port_forward_mode: PortForwardMode,
+    create_pvc: bool,
+    storage_class: str | None,
 ) -> CopyRequest:
     return CopyRequest(
         source=parse_endpoint(raw_source),
@@ -100,6 +102,8 @@ def build_copy_request(
         gid=gid,
         keep_pod=keep_pod,
         port_forward_mode=port_forward_mode,
+        create_pvc=create_pvc,
+        storage_class=storage_class,
     )
 
 
@@ -116,6 +120,22 @@ def build_debug_request(
         target=parse_endpoint(raw_target),
         keep_pod=keep_pod,
         shell=shell,
+    )
+
+
+def build_takeover_request(
+    raw_source: str,
+    raw_target: str,
+    context_name: str | None,
+    namespace: str | None,
+    set_retain: bool,
+) -> TakeoverRequest:
+    return TakeoverRequest(
+        source=parse_endpoint(raw_source),
+        target=parse_endpoint(raw_target),
+        context_name=context_name,
+        namespace=namespace,
+        set_retain=set_retain,
     )
 
 
@@ -158,6 +178,8 @@ class Copy(Command):
         default="auto",
         help="Port forward mode: auto, python, or kubectl",
     )
+    create_pvc: bool = arg(default=False, help="Create the target PVC if it does not exist")
+    storage_class: str | None = arg(default=None, help="StorageClass for a newly created target PVC")
 
     async def run(self) -> None:
         request = build_copy_request(
@@ -169,6 +191,8 @@ class Copy(Command):
             gid=self.gid,
             keep_pod=self.keep_pod,
             port_forward_mode=self.port_forward_mode,
+            create_pvc=self.create_pvc,
+            storage_class=self.storage_class,
         )
         if request.source.kind == "local" and not request.source.path.is_dir():
             raise ValueError(f"Source directory does not exist: {request.source.path}")
@@ -197,6 +221,8 @@ class Copy(Command):
             gid=request.gid,
             keep_pod=request.keep_pod,
             port_forward_mode=request.port_forward_mode,
+            create_pvc=request.create_pvc,
+            storage_class=request.storage_class,
         )
         async with Spinner(
             title=f"Copying {format_endpoint(request.source)} → {format_endpoint(request.target)}",
@@ -295,18 +321,74 @@ class Debug(Command):
         )
 
 
+class TakeoverPvc(Command):
+    """Rebind a migrated PVC volume to the original PVC name."""
+
+    source: str = arg(help="Migrated PVC root, e.g. pvc://media-migrated")
+    target: str = arg(help="Original PVC root name to take over, e.g. pvc://media")
+    context: str | None = arg(default=None, help="Kubernetes context name")
+    namespace: str | None = arg(default=None, help="Kubernetes namespace")
+    set_retain: bool = arg(default=False, help="Temporarily set PV reclaim policy to Retain during takeover")
+
+    async def run(self) -> None:
+        request = build_takeover_request(
+            raw_source=self.source,
+            raw_target=self.target,
+            context_name=self.context,
+            namespace=self.namespace,
+            set_retain=self.set_retain,
+        )
+
+        kube = KubeClient(context_name=request.context_name)
+        namespace = request.namespace or kube.current_namespace()
+        if not namespace:
+            raise ValueError("Namespace is required. Pass --namespace or configure one in kubeconfig.")
+
+        request = TakeoverRequest(
+            source=request.source,
+            target=request.target,
+            context_name=request.context_name,
+            namespace=namespace,
+            set_retain=request.set_retain,
+        )
+        async with Spinner(
+            title=f"Taking over {format_endpoint(request.target)} with {format_endpoint(request.source)}",
+            animation=Spin.DOTS,
+            prefix=" ",
+            suffix="...",
+            speed=1.2,
+        ):
+            session = run_takeover(request=request, kube=kube)
+        console.print(
+            "[green]"
+            f"PVC takeover complete: {format_endpoint(request.target)} now points to PV {session.pv_name}"
+            "[/green]"
+        )
+
+
 def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] == "debug":
-        raw_args = sys.argv[2:]
-        if raw_args and not raw_args[0].startswith("-"):
-            raw_args = ["--target", raw_args[0], *raw_args[1:]]
-        command = Debug.parse(raw_args)
-    else:
-        raw_args = sys.argv[1:]
-        # positional shorthand: kopy ./src pvc://dest  →  --source ./src --target pvc://dest
-        if len(raw_args) >= 2 and not raw_args[0].startswith("-") and not raw_args[1].startswith("-"):
-            raw_args = ["--source", raw_args[0], "--target", raw_args[1], *raw_args[2:]]
-        command = Copy.parse(raw_args)
-    error = command.start()
-    if error:
-        raise SystemExit(str(error))
+    try:
+        if len(sys.argv) > 1 and sys.argv[1] == "debug":
+            raw_args = sys.argv[2:]
+            if raw_args and not raw_args[0].startswith("-"):
+                raw_args = ["--target", raw_args[0], *raw_args[1:]]
+            command = Debug.parse(raw_args)
+        elif len(sys.argv) > 1 and sys.argv[1] == "takeover-pvc":
+            raw_args = sys.argv[2:]
+            if len(raw_args) >= 2 and not raw_args[0].startswith("-") and not raw_args[1].startswith("-"):
+                raw_args = ["--source", raw_args[0], "--target", raw_args[1], *raw_args[2:]]
+            command = TakeoverPvc.parse(raw_args)
+        else:
+            raw_args = sys.argv[1:]
+            # positional shorthand: kopy ./src pvc://dest  →  --source ./src --target pvc://dest
+            if len(raw_args) >= 2 and not raw_args[0].startswith("-") and not raw_args[1].startswith("-"):
+                raw_args = ["--source", raw_args[0], "--target", raw_args[1], *raw_args[2:]]
+            command = Copy.parse(raw_args)
+        error = command.start()
+        if error:
+            raise SystemExit(str(error))
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except Exception as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise SystemExit(1)

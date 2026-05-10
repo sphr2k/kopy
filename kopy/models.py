@@ -26,6 +26,8 @@ class CopyRequest:
     gid: int | None
     keep_pod: bool
     port_forward_mode: PortForwardMode
+    create_pvc: bool
+    storage_class: str | None
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,15 @@ class DebugRequest:
     target: Endpoint
     keep_pod: bool
     shell: str
+
+
+@dataclass(frozen=True)
+class TakeoverRequest:
+    source: Endpoint
+    target: Endpoint
+    context_name: str | None
+    namespace: str | None
+    set_retain: bool
 
 
 @dataclass(frozen=True)
@@ -52,3 +63,10 @@ class CopySession:
 class DebugSession:
     pod_name: str
     namespace: str
+
+
+@dataclass(frozen=True)
+class TakeoverSession:
+    namespace: str
+    pvc_name: str
+    pv_name: str

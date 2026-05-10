@@ -11,6 +11,35 @@ from kubernetes.stream import stream
 from .models import DebugRequest, Endpoint
 
 
+HELPER_POD_TOLERATIONS = [{"operator": "Exists"}]
+
+
+def build_pvc_manifest(
+    pvc_name: str,
+    access_modes: list[str],
+    requested_storage: str,
+    storage_class_name: str | None,
+    volume_name: str | None = None,
+    volume_mode: str | None = None,
+) -> dict[str, Any]:
+    spec: dict[str, Any] = {
+        "accessModes": access_modes,
+        "resources": {"requests": {"storage": requested_storage}},
+    }
+    if storage_class_name is not None:
+        spec["storageClassName"] = storage_class_name
+    if volume_name is not None:
+        spec["volumeName"] = volume_name
+    if volume_mode is not None:
+        spec["volumeMode"] = volume_mode
+    return {
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": pvc_name},
+        "spec": spec,
+    }
+
+
 def build_helper_pod_manifest(
     pvc_endpoint: Endpoint,
     pod_name: str,
@@ -47,6 +76,7 @@ exec rsync --daemon --no-detach --config=/tmp/kopy/rsyncd.conf --port={rsync_por
         },
         "spec": {
             "restartPolicy": "Never",
+            "tolerations": HELPER_POD_TOLERATIONS,
             "containers": [
                 {
                     "name": "copy-agent",
@@ -96,6 +126,7 @@ def build_debug_pod_manifest(
         },
         "spec": {
             "restartPolicy": "Never",
+            "tolerations": HELPER_POD_TOLERATIONS,
             "containers": [
                 {
                     "name": "debug-shell",
@@ -143,6 +174,7 @@ def build_dual_pvc_pod_manifest(
         },
         "spec": {
             "restartPolicy": "Never",
+            "tolerations": HELPER_POD_TOLERATIONS,
             "containers": [
                 {
                     "name": "copy-agent",
@@ -212,8 +244,89 @@ class KubeClient:
         items = self._core_api.list_namespaced_persistent_volume_claim(namespace=namespace).items
         return sorted(item.metadata.name for item in items if item.metadata and item.metadata.name)
 
+    def get_pvc(self, namespace: str, pvc_name: str) -> dict[str, Any] | None:
+        try:
+            pvc = self._core_api.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=namespace)
+        except client.ApiException as exc:
+            if exc.status == 404:
+                return None
+            raise
+        return cast(dict[str, Any], self._core_api.api_client.sanitize_for_serialization(pvc))
+
+    def create_pvc(self, namespace: str, manifest: dict[str, Any]) -> dict[str, Any]:
+        pvc = self._core_api.create_namespaced_persistent_volume_claim(namespace=namespace, body=manifest)
+        return cast(dict[str, Any], self._core_api.api_client.sanitize_for_serialization(pvc))
+
+    def delete_pvc(self, namespace: str, pvc_name: str) -> None:
+        self._core_api.delete_namespaced_persistent_volume_claim(name=pvc_name, namespace=namespace)
+
+    def get_pv(self, pv_name: str) -> dict[str, Any]:
+        pv = self._core_api.read_persistent_volume(name=pv_name)
+        return cast(dict[str, Any], self._core_api.api_client.sanitize_for_serialization(pv))
+
+    def patch_pv(self, pv_name: str, body: dict[str, Any]) -> dict[str, Any]:
+        pv = self._core_api.patch_persistent_volume(name=pv_name, body=body)
+        return cast(dict[str, Any], self._core_api.api_client.sanitize_for_serialization(pv))
+
+    def get_pvc_bound_node(self, namespace: str, pvc_name: str) -> str | None:
+        """Return the kubernetes.io/hostname of the node a bound PVC's PV is affined to, if any."""
+        pvc = self._core_api.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=namespace)
+        volume_name = pvc.spec and pvc.spec.volume_name
+        if not volume_name:
+            return None
+        pv = self._core_api.read_persistent_volume(name=volume_name)
+        required = pv.spec and pv.spec.node_affinity and pv.spec.node_affinity.required
+        if not required or not required.node_selector_terms:
+            return None
+        for term in required.node_selector_terms:
+            for expr in term.match_expressions or []:
+                if expr.key == "kubernetes.io/hostname" and expr.operator == "In" and expr.values:
+                    return expr.values[0]
+        return None
+
+    def ensure_pvc_bound(self, namespace: str, pvc_name: str, selected_node: str, timeout_seconds: int = 120) -> None:
+        """Annotate a pending PVC with selected-node to trigger WaitForFirstConsumer provisioning, then wait for it to bind.
+
+        Fails fast if the CSI provisioner emits a ProvisioningFailed event.
+        """
+        pvc = self._core_api.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=namespace)
+        if pvc.status and pvc.status.phase == "Bound":
+            return
+        self._core_api.patch_namespaced_persistent_volume_claim(
+            name=pvc_name,
+            namespace=namespace,
+            body={"metadata": {"annotations": {"volume.kubernetes.io/selected-node": selected_node}}},
+        )
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            pvc = self._core_api.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=namespace)
+            if pvc.status and pvc.status.phase == "Bound":
+                return
+            events = self._core_api.list_namespaced_event(
+                namespace=namespace,
+                field_selector=f"involvedObject.name={pvc_name},involvedObject.kind=PersistentVolumeClaim,reason=ProvisioningFailed",
+            )
+            if events.items:
+                msg = events.items[-1].message or "provisioning failed"
+                raise ValueError(f"Target PVC {namespace}/{pvc_name} cannot be provisioned: {msg}")
+            time.sleep(2)
+        raise TimeoutError(f"Timed out waiting for PVC {namespace}/{pvc_name} to bind")
+
     def create_helper_pod(self, namespace: str, manifest: dict[str, Any]) -> client.V1Pod:
         return cast(client.V1Pod, self._core_api.create_namespaced_pod(namespace=namespace, body=manifest))
+
+    def wait_for_pvc_bound(self, namespace: str, pvc_name: str, expected_volume_name: str, timeout_seconds: int = 30) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            pvc = self._core_api.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=namespace)
+            if pvc.status and pvc.status.phase == "Bound":
+                actual = pvc.spec.volume_name if pvc.spec else None
+                if actual == expected_volume_name:
+                    return
+            time.sleep(1)
+        raise TimeoutError(
+            f"Timed out waiting for PVC {namespace}/{pvc_name} to bind to volume {expected_volume_name}"
+        )
 
     def get_pod(self, namespace: str, pod_name: str) -> client.V1Pod:
         return cast(client.V1Pod, self._core_api.read_namespaced_pod(name=pod_name, namespace=namespace))

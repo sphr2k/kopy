@@ -15,3 +15,4 @@ def test_debug_pod_manifest_mounts_requested_pvc_and_sleeps() -> None:
     assert manifest["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"] == "plex-config"
     assert container["securityContext"]["runAsUser"] == 0
     assert container["command"] == ["sh", "-c", "mkdir -p /data/debug && exec sleep infinity"]
+    assert manifest["spec"]["tolerations"] == [{"operator": "Exists"}]
