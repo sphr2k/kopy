@@ -81,6 +81,21 @@ def print_copy_info(source: Endpoint, pod_name: str, target: Endpoint) -> None:
     )
 
 
+def print_top_level_help() -> None:
+    console.print("kopy")
+    console.print("")
+    console.print("Copy data between local paths and Kubernetes PVCs, and between Kubernetes PVCs.")
+    console.print("")
+    console.print("[cyan]Usage:[/cyan] [bold]kopy[/bold] <command> [options]")
+    console.print("")
+    console.print("[magenta bold]Commands[/magenta bold]")
+    console.print("  [cyan bold]copy[/cyan bold]          Copy data between local paths and Kubernetes PVCs, and between Kubernetes PVCs")
+    console.print("  [cyan bold]debug[/cyan bold]         Attach a shell to a helper pod with a mounted PVC")
+    console.print("  [cyan bold]takeover-pvc[/cyan bold]  Rebind a migrated PVC volume to the original PVC name")
+    console.print("")
+    console.print("Run `kopy <command> --help` for command-specific options.")
+
+
 def build_copy_request(
     raw_source: str,
     raw_target: str,
@@ -164,7 +179,7 @@ def resolve_endpoint(
 
 
 class Copy(Command):
-    """Copy between local paths and Kubernetes PVCs."""
+    """Copy data between local paths and Kubernetes PVCs, and between Kubernetes PVCs."""
 
     source: str = arg(help="Source: local path or pvc://name/subpath")
     target: str = arg(help="Target: local path or pvc://name/subpath")
@@ -368,6 +383,9 @@ class TakeoverPvc(Command):
 
 def main() -> None:
     try:
+        if len(sys.argv) <= 1 or sys.argv[1] in {"-h", "--help", "help"}:
+            print_top_level_help()
+            return
         if len(sys.argv) > 1 and sys.argv[1] == "debug":
             raw_args = sys.argv[2:]
             if raw_args and not raw_args[0].startswith("-"):

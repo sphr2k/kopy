@@ -1,6 +1,6 @@
 # kopy
 
-Copy a local directory into a Kubernetes target.
+Copy data between local paths and Kubernetes PVC targets.
 
 ## Examples
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+from subprocess import run
 
 from kopy.cli import build_copy_request, build_debug_request, build_takeover_request
 
@@ -101,3 +102,19 @@ def test_build_takeover_request_preserves_endpoints() -> None:
     assert request.source.path == Path(".")
     assert request.target.path == Path(".")
     assert request.set_retain is True
+
+
+def test_top_level_help_lists_available_commands() -> None:
+    result = run(
+        ["uv", "run", "kopy", "--help"],
+        cwd="/Users/jan.werner/projects/kopy",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "Commands" in result.stdout
+    assert "copy" in result.stdout
+    assert "debug" in result.stdout
+    assert "takeover-pvc" in result.stdout
