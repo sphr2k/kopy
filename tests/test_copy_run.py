@@ -415,8 +415,9 @@ def test_run_copy_requires_create_flag_for_missing_target_pvc() -> None:
         raise AssertionError("expected missing target PVC to fail")
 
 
-def test_run_takeover_rebinds_migrated_volume_to_original_name() -> None:
+def test_run_takeover_rebinds_migrated_volume_to_missing_original_name() -> None:
     kube = FakeKubeClient()
+    kube.pvcs.pop(("demo", "media"), None)
     kube.pvcs[("demo", "media-migrated")] = {
         "metadata": {"name": "media-migrated"},
         "spec": {
@@ -428,16 +429,6 @@ def test_run_takeover_rebinds_migrated_volume_to_original_name() -> None:
         },
         "status": {"phase": "Bound"},
     }
-    kube.pvcs[("demo", "media")] = {
-        "metadata": {"name": "media"},
-        "spec": {
-            "accessModes": ["ReadWriteOnce"],
-            "resources": {"requests": {"storage": "50Gi"}},
-            "storageClassName": "slow-hdd",
-            "volumeName": "pv-original",
-        },
-        "status": {"phase": "Bound"},
-    }
     kube.pvs["pv-migrated"] = {
         "metadata": {
             "name": "pv-migrated",
@@ -446,10 +437,6 @@ def test_run_takeover_rebinds_migrated_volume_to_original_name() -> None:
                 "pv.kubernetes.io/bound-by-controller": "yes",
             },
         },
-        "spec": {"persistentVolumeReclaimPolicy": "Retain"},
-    }
-    kube.pvs["pv-original"] = {
-        "metadata": {"name": "pv-original", "annotations": {}},
         "spec": {"persistentVolumeReclaimPolicy": "Retain"},
     }
 
@@ -467,7 +454,7 @@ def test_run_takeover_rebinds_migrated_volume_to_original_name() -> None:
     assert session.namespace == "demo"
     assert session.pvc_name == "media"
     assert session.pv_name == "pv-migrated"
-    assert kube.deleted_pvcs == [("demo", "media"), ("demo", "media-migrated")]
+    assert kube.deleted_pvcs == [("demo", "media-migrated")]
     assert kube.patched_pvs == [
         (
             "pv-migrated",
@@ -497,6 +484,59 @@ def test_run_takeover_rebinds_migrated_volume_to_original_name() -> None:
             },
         },
     )
+
+
+def test_run_takeover_deletes_existing_original_pvc_before_rebind() -> None:
+    kube = FakeKubeClient()
+    kube.pvcs[("demo", "media-migrated")] = {
+        "metadata": {"name": "media-migrated"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "50Gi"}},
+            "storageClassName": "fast-ssd",
+            "volumeMode": "Filesystem",
+            "volumeName": "pv-migrated",
+        },
+        "status": {"phase": "Bound"},
+    }
+    kube.pvs["pv-migrated"] = {
+        "metadata": {
+            "name": "pv-migrated",
+            "annotations": {
+                "pv.kubernetes.io/bind-completed": "yes",
+                "pv.kubernetes.io/bound-by-controller": "yes",
+            },
+        },
+        "spec": {"persistentVolumeReclaimPolicy": "Retain"},
+    }
+    kube.pvcs[("demo", "media")] = {
+        "metadata": {"name": "media"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "50Gi"}},
+            "storageClassName": "slow-hdd",
+            "volumeName": "pv-original",
+        },
+        "status": {"phase": "Bound"},
+    }
+    kube.pvs["pv-original"] = {
+        "metadata": {"name": "pv-original", "annotations": {}},
+        "spec": {"persistentVolumeReclaimPolicy": "Retain"},
+    }
+
+    session = run_takeover(
+        request=TakeoverRequest(
+            source=Endpoint(kind="pvc", resource_name="media-migrated", path=Path(".")),
+            target=Endpoint(kind="pvc", resource_name="media", path=Path(".")),
+            context_name="ctx",
+            namespace="demo",
+            set_retain=False,
+        ),
+        kube=kube,
+    )
+
+    assert session.pvc_name == "media"
+    assert kube.deleted_pvcs == [("demo", "media"), ("demo", "media-migrated")]
 
 
 def test_run_takeover_requires_retain_reclaim_policy() -> None:

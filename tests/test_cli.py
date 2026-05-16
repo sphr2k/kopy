@@ -117,4 +117,5 @@ def test_top_level_help_lists_available_commands() -> None:
     assert "Commands" in result.stdout
     assert "copy" in result.stdout
     assert "debug" in result.stdout
-    assert "takeover-pvc" in result.stdout
+    assert "rebind-pvc" in result.stdout
+    assert "takeover-pvc" not in result.stdout

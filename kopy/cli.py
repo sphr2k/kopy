@@ -91,7 +91,7 @@ def print_top_level_help() -> None:
     console.print("[magenta bold]Commands[/magenta bold]")
     console.print("  [cyan bold]copy[/cyan bold]          Copy data between local paths and Kubernetes PVCs, and between Kubernetes PVCs")
     console.print("  [cyan bold]debug[/cyan bold]         Attach a shell to a helper pod with a mounted PVC")
-    console.print("  [cyan bold]takeover-pvc[/cyan bold]  Rebind a migrated PVC volume to the original PVC name")
+    console.print("  [cyan bold]rebind-pvc[/cyan bold]    Rebind a migrated PVC volume to the original PVC name")
     console.print("")
     console.print("Run `kopy <command> --help` for command-specific options.")
 
@@ -391,7 +391,7 @@ def main() -> None:
             if raw_args and not raw_args[0].startswith("-"):
                 raw_args = ["--target", raw_args[0], *raw_args[1:]]
             command = Debug.parse(raw_args)
-        elif len(sys.argv) > 1 and sys.argv[1] == "takeover-pvc":
+        elif len(sys.argv) > 1 and sys.argv[1] == "rebind-pvc":
             raw_args = sys.argv[2:]
             if len(raw_args) >= 2 and not raw_args[0].startswith("-") and not raw_args[1].startswith("-"):
                 raw_args = ["--source", raw_args[0], "--target", raw_args[1], *raw_args[2:]]

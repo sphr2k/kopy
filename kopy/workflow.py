@@ -153,22 +153,23 @@ def run_takeover(
     target_pvc = kube.get_pvc(namespace, request.target.resource_name)  # type: ignore[attr-defined]
     if source_pvc is None:
         raise ValueError(f"Source PVC {namespace}/{request.source.resource_name} does not exist")
-    if target_pvc is None:
-        raise ValueError(f"Target PVC {namespace}/{request.target.resource_name} does not exist")
 
     source_spec = source_pvc.get("spec", {})
-    target_spec = target_pvc.get("spec", {})
     source_pv_name = source_spec.get("volumeName")
-    target_pv_name = target_spec.get("volumeName")
-    if not source_pv_name or not target_pv_name:
-        raise ValueError("Both PVCs must already be bound to PVs before takeover")
+    if not source_pv_name:
+        raise ValueError("Source PVC must already be bound to a PV before takeover")
 
     source_pv = kube.get_pv(source_pv_name)  # type: ignore[attr-defined]
-    target_pv = kube.get_pv(target_pv_name)  # type: ignore[attr-defined]
     reclaim_policies = {
         source_pv_name: source_pv.get("spec", {}).get("persistentVolumeReclaimPolicy"),
-        target_pv_name: target_pv.get("spec", {}).get("persistentVolumeReclaimPolicy"),
     }
+    if target_pvc is not None:
+        target_spec = target_pvc.get("spec", {})
+        target_pv_name = target_spec.get("volumeName")
+        if not target_pv_name:
+            raise ValueError("Target PVC must already be bound to a PV before takeover")
+        target_pv = kube.get_pv(target_pv_name)  # type: ignore[attr-defined]
+        reclaim_policies[target_pv_name] = target_pv.get("spec", {}).get("persistentVolumeReclaimPolicy")
     patched_pvs: list[tuple[str, str]] = []
     for pv_name, reclaim_policy in reclaim_policies.items():
         if reclaim_policy == "Retain":
@@ -181,7 +182,8 @@ def run_takeover(
         patched_pvs.append((pv_name, reclaim_policy))
 
     try:
-        kube.delete_pvc(namespace, request.target.resource_name)  # type: ignore[attr-defined]
+        if target_pvc is not None:
+            kube.delete_pvc(namespace, request.target.resource_name)  # type: ignore[attr-defined]
         kube.delete_pvc(namespace, request.source.resource_name)  # type: ignore[attr-defined]
         kube.patch_pv(  # type: ignore[attr-defined]
             source_pv_name,
