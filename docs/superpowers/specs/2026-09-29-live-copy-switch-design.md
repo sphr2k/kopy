@@ -55,7 +55,8 @@ releases the staging PVC and binds its PV under the source claim name.
 - `switch` fails before copying if an active pod still references the source
   PVC, or if either PV is not `Retain`.
 - The source HostPath mount is read-only and points to one PV mount directory;
-  helper containers run non-root with privilege escalation disabled.
+  its reader runs non-root. The destination rsync daemon retains Kopy's current
+  ownership-preserving identity behavior, with privilege escalation disabled.
 - Temporary pods and Service are deleted on success and failure. A failed
   final sync leaves both PVCs and PVs available for retry.
 - NetworkPolicy and image-pull failures are reported as transfer errors; no
