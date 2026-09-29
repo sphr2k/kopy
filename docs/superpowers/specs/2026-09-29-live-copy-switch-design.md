@@ -17,8 +17,10 @@ to node 1, so a final transfer must use separate source and destination pods.
 
 ## CLI workflow
 
-1. `kopy copy pvc://SOURCE pvc://TARGET --live` performs a warm, non-authoritative
-   sync. It requires the source PVC to be mounted by exactly one active pod.
+1. `kopy copy pvc://SOURCE pvc://TARGET --source-host-mount` performs a warm,
+   non-authoritative sync. The flag explicitly opts into reading the existing
+   source mount through a read-only HostPath. It requires the source PVC to be
+   mounted by exactly one active pod.
 2. The operator stops the workload through its normal control plane and waits
    until no active pod references the source PVC.
 3. `kopy switch pvc://SOURCE pvc://TARGET` performs an authoritative final
@@ -47,8 +49,9 @@ releases the staging PVC and binds its PV under the source claim name.
 
 - The warm copy is explicitly non-authoritative; only `switch` performs the
   final deletion sync and claim rebind.
-- `--live` fails if it cannot identify one ready source pod and the source PV
-  mount directory. It never falls back to mounting the live source PVC again.
+- `--source-host-mount` fails if it cannot identify one ready source pod and
+  the source PV mount directory. It never falls back to mounting the live
+  source PVC again.
 - `switch` fails before copying if an active pod still references the source
   PVC, or if either PV is not `Retain`.
 - The source HostPath mount is read-only and points to one PV mount directory;
@@ -60,7 +63,7 @@ releases the staging PVC and binds its PV under the source claim name.
 
 ## Scope
 
-This adds a live-source mode for PVC-to-PVC copies and a dedicated `switch`
-command. Existing local-to-PVC, PVC-to-local, ordinary PVC-to-PVC, and `move`
-behavior remain available. Snapshot support and application-specific backup
-formats are out of scope.
+This adds an explicit `--source-host-mount` mode for PVC-to-PVC copies and a
+dedicated `switch` command. Existing local-to-PVC, PVC-to-local, ordinary
+PVC-to-PVC, and `move` behavior remain available. Snapshot support and
+application-specific backup formats are out of scope.
