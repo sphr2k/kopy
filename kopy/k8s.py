@@ -72,10 +72,12 @@ exec rsync --daemon --no-detach --config=/tmp/kopy/rsyncd.conf --port={rsync_por
             "labels": {
                 "app.kubernetes.io/name": "kopy",
                 "app.kubernetes.io/component": "copy-helper",
+                "kopy.io/pod-name": pod_name,
             },
         },
         "spec": {
             "restartPolicy": "Never",
+            "automountServiceAccountToken": False,
             "tolerations": HELPER_POD_TOLERATIONS,
             "containers": [
                 {
@@ -90,6 +92,8 @@ exec rsync --daemon --no-detach --config=/tmp/kopy/rsyncd.conf --port={rsync_por
                     "securityContext": {
                         "runAsUser": 0,
                         "runAsGroup": 0,
+                        "allowPrivilegeEscalation": False,
+                        "seccompProfile": {"type": "RuntimeDefault"},
                     },
                     "volumeMounts": [{"name": "target-volume", "mountPath": mount_path}],
                 }
@@ -100,6 +104,116 @@ exec rsync --daemon --no-detach --config=/tmp/kopy/rsyncd.conf --port={rsync_por
                     "persistentVolumeClaim": {"claimName": pvc_endpoint.resource_name},
                 }
             ],
+        },
+    }
+
+
+def build_hostpath_source_pod_manifest(
+    pod_name: str,
+    image: str,
+    host_path: str,
+    mount_path: str,
+    node_name: str,
+    rsync_command: list[str],
+) -> dict[str, Any]:
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name,
+            "labels": {
+                "app.kubernetes.io/name": "kopy",
+                "app.kubernetes.io/component": "hostpath-source-helper",
+            },
+        },
+        "spec": {
+            "restartPolicy": "Never",
+            "automountServiceAccountToken": False,
+            "nodeName": node_name,
+            "tolerations": HELPER_POD_TOLERATIONS,
+            "containers": [
+                {
+                    "name": "copy-agent",
+                    "image": image,
+                    "command": rsync_command,
+                    "securityContext": {
+                        "runAsNonRoot": True,
+                        "runAsUser": 65532,
+                        "runAsGroup": 65532,
+                        "allowPrivilegeEscalation": False,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "volumeMounts": [{"name": "source-volume", "mountPath": mount_path, "readOnly": True}],
+                }
+            ],
+            "volumes": [
+                {
+                    "name": "source-volume",
+                    "hostPath": {"path": host_path, "type": "Directory"},
+                }
+            ],
+        },
+    }
+
+
+def build_source_pvc_pod_manifest(
+    pvc_name: str,
+    pod_name: str,
+    image: str,
+    mount_path: str,
+    node_name: str | None,
+    rsync_command: list[str],
+) -> dict[str, Any]:
+    spec: dict[str, Any] = {
+        "restartPolicy": "Never",
+        "automountServiceAccountToken": False,
+        "tolerations": HELPER_POD_TOLERATIONS,
+        "containers": [
+            {
+                "name": "copy-agent",
+                "image": image,
+                "command": rsync_command,
+                "securityContext": {
+                    "runAsUser": 0,
+                    "runAsGroup": 0,
+                    "allowPrivilegeEscalation": False,
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                },
+                "volumeMounts": [{"name": "source-volume", "mountPath": mount_path, "readOnly": True}],
+            }
+        ],
+        "volumes": [
+            {
+                "name": "source-volume",
+                "persistentVolumeClaim": {"claimName": pvc_name},
+            }
+        ],
+    }
+    if node_name:
+        spec["nodeName"] = node_name
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name,
+            "labels": {
+                "app.kubernetes.io/name": "kopy",
+                "app.kubernetes.io/component": "pvc-source-helper",
+            },
+        },
+        "spec": spec,
+    }
+
+
+def build_rsync_service_manifest(service_name: str, selector: dict[str, str], rsync_port: int) -> dict[str, Any]:
+    return {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": service_name, "labels": {"app.kubernetes.io/name": "kopy"}},
+        "spec": {
+            "type": "ClusterIP",
+            "selector": selector,
+            "ports": [{"name": "rsync", "port": rsync_port, "targetPort": rsync_port, "protocol": "TCP"}],
         },
     }
 
@@ -253,12 +367,116 @@ class KubeClient:
             raise
         return cast(dict[str, Any], self._core_api.api_client.sanitize_for_serialization(pvc))
 
+    def get_pvc_pod_references(self, namespace: str, pvc_name: str) -> list[dict[str, Any]]:
+        pods = self._core_api.list_namespaced_pod(namespace=namespace).items
+        consumers = []
+        for pod in pods:
+            if pod.metadata is None:
+                continue
+            volumes = pod.spec.volumes if pod.spec else None
+            if any(volume.persistent_volume_claim and volume.persistent_volume_claim.claim_name == pvc_name for volume in volumes or []):
+                consumers.append(cast(dict[str, Any], self._core_api.api_client.sanitize_for_serialization(pod)))
+        return consumers
+
+    def get_pvc_consumers(self, namespace: str, pvc_name: str) -> list[dict[str, Any]]:
+        return [
+            pod
+            for pod in self.get_pvc_pod_references(namespace, pvc_name)
+            if pod.get("metadata", {}).get("deletionTimestamp") is None
+            and pod.get("status", {}).get("phase") not in {"Succeeded", "Failed"}
+        ]
+
+    def get_pvc_mount_source(self, namespace: str, pvc_name: str) -> dict[str, Any]:
+        consumers = self.get_pvc_consumers(namespace, pvc_name)
+        if len(consumers) != 1:
+            raise ValueError(f"Expected exactly one active pod using PVC {namespace}/{pvc_name}, found {len(consumers)}")
+        pod = consumers[0]
+        status = pod.get("status", {})
+        conditions = status.get("conditions", [])
+        if status.get("phase") != "Running" or not any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions):
+            raise ValueError(f"Pod {namespace}/{pod['metadata']['name']} using PVC {pvc_name} is not Ready")
+        pvc = self.get_pvc(namespace, pvc_name)
+        volume_name = (pvc or {}).get("spec", {}).get("volumeName")
+        if not volume_name:
+            raise ValueError(f"PVC {namespace}/{pvc_name} is not bound to a PV")
+        pv = self.get_pv(volume_name)
+        csi = pv.get("spec", {}).get("csi")
+        if not csi or not csi.get("driver"):
+            raise ValueError(f"PV {volume_name} is not CSI-backed; cannot derive its kubelet mount path")
+        uid = pod.get("metadata", {}).get("uid")
+        node_name = pod.get("spec", {}).get("nodeName")
+        if not uid or not node_name:
+            raise ValueError(f"Pod {namespace}/{pod['metadata']['name']} is missing its UID or node name")
+        host_path = f"/var/lib/kubelet/pods/{uid}/volumes/kubernetes.io~csi/{volume_name}/mount"
+        return {"pod_name": pod["metadata"]["name"], "pod_uid": uid, "node_name": node_name, "pv_name": volume_name, "host_path": host_path}
+
+    def create_service(self, namespace: str, manifest: dict[str, Any]) -> dict[str, Any]:
+        service = self._core_api.create_namespaced_service(namespace=namespace, body=manifest)
+        return cast(dict[str, Any], self._core_api.api_client.sanitize_for_serialization(service))
+
+    def delete_service(self, namespace: str, service_name: str) -> None:
+        try:
+            self._core_api.delete_namespaced_service(name=service_name, namespace=namespace)
+        except client.ApiException as exc:
+            if exc.status != 404:
+                raise
+
+    def wait_for_service_ready(self, namespace: str, service_name: str, timeout_seconds: int = 30) -> str:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            service = self._core_api.read_namespaced_service(name=service_name, namespace=namespace)
+            cluster_ip = service.spec.cluster_ip if service.spec else None
+            if cluster_ip and cluster_ip != "None":
+                endpoints = self._core_api.read_namespaced_endpoints(name=service_name, namespace=namespace)
+                if any(subset.addresses for subset in endpoints.subsets or []):
+                    return cluster_ip
+            time.sleep(1)
+        raise TimeoutError(f"Timed out waiting for service {namespace}/{service_name} to become routable")
+
+    def wait_for_pod_completed(self, namespace: str, pod_name: str, timeout_seconds: int = 3600) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            pod = self.get_pod(namespace, pod_name)
+            status = pod.status
+            if status and status.phase in {"Succeeded", "Failed"}:
+                container_statuses = status.container_statuses or []
+                exit_codes = [state.terminated.exit_code for item in container_statuses if (state := item.state) and state.terminated]
+                if status.phase == "Succeeded" and exit_codes and all(code == 0 for code in exit_codes):
+                    return
+                reason = "; ".join(
+                    f"{item.name}: exit_code={item.state.terminated.exit_code}, "
+                    f"reason={item.state.terminated.reason or 'unknown'}, "
+                    f"message={item.state.terminated.message or 'none'}"
+                    for item in container_statuses
+                    if item.state and item.state.terminated
+                )
+                logs = ""
+                if container_statuses:
+                    with contextlib.suppress(Exception):
+                        logs = self.get_pod_log(namespace, pod_name, container_statuses[0].name)
+                suffix = f"\nContainer output:\n{logs.strip()}" if logs.strip() else ""
+                raise RuntimeError(f"Pod {namespace}/{pod_name} failed: {reason or status.phase}{suffix}")
+            time.sleep(2)
+        raise TimeoutError(f"Timed out waiting for pod {namespace}/{pod_name} to complete")
+
     def create_pvc(self, namespace: str, manifest: dict[str, Any]) -> dict[str, Any]:
         pvc = self._core_api.create_namespaced_persistent_volume_claim(namespace=namespace, body=manifest)
         return cast(dict[str, Any], self._core_api.api_client.sanitize_for_serialization(pvc))
 
     def delete_pvc(self, namespace: str, pvc_name: str) -> None:
         self._core_api.delete_namespaced_persistent_volume_claim(name=pvc_name, namespace=namespace)
+
+    def wait_for_pvc_deleted(self, namespace: str, pvc_name: str, timeout_seconds: int = 30) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                self._core_api.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=namespace)
+            except client.ApiException as exc:
+                if exc.status == 404:
+                    return
+                raise
+            time.sleep(1)
+        raise TimeoutError(f"Timed out waiting for PVC {namespace}/{pvc_name} to be deleted")
 
     def get_pv(self, pv_name: str) -> dict[str, Any]:
         pv = self._core_api.read_persistent_volume(name=pv_name)
@@ -280,7 +498,7 @@ class KubeClient:
             return None
         for term in required.node_selector_terms:
             for expr in term.match_expressions or []:
-                if expr.key == "kubernetes.io/hostname" and expr.operator == "In" and expr.values:
+                if expr.key in {"kubernetes.io/hostname", "openebs.io/nodename"} and expr.operator == "In" and expr.values:
                     return expr.values[0]
         return None
 
@@ -331,6 +549,12 @@ class KubeClient:
     def get_pod(self, namespace: str, pod_name: str) -> client.V1Pod:
         return cast(client.V1Pod, self._core_api.read_namespaced_pod(name=pod_name, namespace=namespace))
 
+    def get_pod_log(self, namespace: str, pod_name: str, container_name: str) -> str:
+        return cast(
+            str,
+            self._core_api.read_namespaced_pod_log(name=pod_name, namespace=namespace, container=container_name),
+        )
+
     def delete_pod(self, namespace: str, pod_name: str) -> None:
         self._core_api.delete_namespaced_pod(name=pod_name, namespace=namespace)
 
@@ -360,3 +584,15 @@ class KubeClient:
                     return
             time.sleep(1)
         raise TimeoutError(f"Timed out waiting for pod {namespace}/{pod_name} to become Ready")
+
+    def wait_for_pod_deleted(self, namespace: str, pod_name: str, timeout_seconds: int = 30) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                self.get_pod(namespace, pod_name)
+            except client.ApiException as exc:
+                if exc.status == 404:
+                    return
+                raise
+            time.sleep(1)
+        raise TimeoutError(f"Timed out waiting for pod {namespace}/{pod_name} to be deleted")

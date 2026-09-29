@@ -28,6 +28,7 @@ class CopyRequest:
     port_forward_mode: PortForwardMode
     create_pvc: bool
     storage_class: str | None
+    source_host_mount: bool = False
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,16 @@ class TakeoverRequest:
     context_name: str | None
     namespace: str | None
     set_retain: bool
+
+
+@dataclass(frozen=True)
+class MoveRequest:
+    source: Endpoint
+    target: Endpoint
+    context_name: str | None
+    namespace: str | None
+    set_retain: bool
+    storage_class: str | None
 
 
 @dataclass(frozen=True)
@@ -70,3 +81,19 @@ class TakeoverSession:
     namespace: str
     pvc_name: str
     pv_name: str
+
+
+@dataclass(frozen=True)
+class MoveSession:
+    source: Endpoint
+    target: Endpoint
+    copy: CopySession
+    rebind: TakeoverSession
+
+
+@dataclass(frozen=True)
+class SwitchRequest:
+    source: Endpoint
+    target: Endpoint
+    context_name: str | None
+    namespace: str | None

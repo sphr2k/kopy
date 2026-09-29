@@ -1,7 +1,7 @@
 from pathlib import Path
 from subprocess import run
 
-from kopy.cli import build_copy_request, build_debug_request, build_takeover_request
+from kopy.cli import build_copy_request, build_debug_request, build_move_request, build_takeover_request
 
 
 def test_build_copy_request_defaults_to_root_subpath() -> None:
@@ -104,6 +104,26 @@ def test_build_takeover_request_preserves_endpoints() -> None:
     assert request.set_retain is True
 
 
+def test_build_move_request_preserves_root_pvc_endpoints() -> None:
+    request = build_move_request(
+        raw_source="pvc://media",
+        raw_target="pvc://media-migrated",
+        context_name="ctx",
+        namespace="demo",
+        set_retain=True,
+        storage_class="fast-ssd",
+    )
+
+    assert request.context_name == "ctx"
+    assert request.namespace == "demo"
+    assert request.source.resource_name == "media"
+    assert request.target.resource_name == "media-migrated"
+    assert request.source.path == Path(".")
+    assert request.target.path == Path(".")
+    assert request.set_retain is True
+    assert request.storage_class == "fast-ssd"
+
+
 def test_top_level_help_lists_available_commands() -> None:
     result = run(
         ["uv", "run", "kopy", "--help"],
@@ -117,5 +137,6 @@ def test_top_level_help_lists_available_commands() -> None:
     assert "Commands" in result.stdout
     assert "copy" in result.stdout
     assert "debug" in result.stdout
+    assert "move" in result.stdout
     assert "rebind-pvc" in result.stdout
     assert "takeover-pvc" not in result.stdout

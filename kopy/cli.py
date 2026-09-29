@@ -8,12 +8,12 @@ from clypi import ClypiConfig, Command, Spin, Spinner, Styler, Theme, arg, confi
 from rich.panel import Panel
 
 from .k8s import KubeClient
-from .models import CopyRequest, DebugRequest, Endpoint, PortForwardMode, TakeoverRequest
+from .models import CopyRequest, DebugRequest, Endpoint, MoveRequest, PortForwardMode, SwitchRequest, TakeoverRequest
 from .settings import settings
 from .target import parse_endpoint
 from .transport import open_transport_session, run_interactive_command, run_rsync_command
 from .ui import console, pick_with_fzf
-from .workflow import run_copy, run_debug_session, run_takeover
+from .workflow import run_copy, run_debug_session, run_move, run_switch, run_takeover
 
 
 configure(
@@ -91,7 +91,9 @@ def print_top_level_help() -> None:
     console.print("[magenta bold]Commands[/magenta bold]")
     console.print("  [cyan bold]copy[/cyan bold]          Copy data between local paths and Kubernetes PVCs, and between Kubernetes PVCs")
     console.print("  [cyan bold]debug[/cyan bold]         Attach a shell to a helper pod with a mounted PVC")
+    console.print("  [cyan bold]move[/cyan bold]          Copy a PVC to a migrated PVC and rebind the original name on success")
     console.print("  [cyan bold]rebind-pvc[/cyan bold]    Rebind a migrated PVC volume to the original PVC name")
+    console.print("  [cyan bold]switch[/cyan bold]       Final-sync a stopped PVC and rebind its original claim name")
     console.print("")
     console.print("Run `kopy <command> --help` for command-specific options.")
 
@@ -107,6 +109,7 @@ def build_copy_request(
     port_forward_mode: PortForwardMode,
     create_pvc: bool,
     storage_class: str | None,
+    source_host_mount: bool = False,
 ) -> CopyRequest:
     return CopyRequest(
         source=parse_endpoint(raw_source),
@@ -119,6 +122,7 @@ def build_copy_request(
         port_forward_mode=port_forward_mode,
         create_pvc=create_pvc,
         storage_class=storage_class,
+        source_host_mount=source_host_mount,
     )
 
 
@@ -151,6 +155,24 @@ def build_takeover_request(
         context_name=context_name,
         namespace=namespace,
         set_retain=set_retain,
+    )
+
+
+def build_move_request(
+    raw_source: str,
+    raw_target: str,
+    context_name: str | None,
+    namespace: str | None,
+    set_retain: bool,
+    storage_class: str | None,
+) -> MoveRequest:
+    return MoveRequest(
+        source=parse_endpoint(raw_source),
+        target=parse_endpoint(raw_target),
+        context_name=context_name,
+        namespace=namespace,
+        set_retain=set_retain,
+        storage_class=storage_class,
     )
 
 
@@ -195,6 +217,10 @@ class Copy(Command):
     )
     create_pvc: bool = arg(default=False, help="Create the target PVC if it does not exist")
     storage_class: str | None = arg(default=None, help="StorageClass for a newly created target PVC")
+    source_host_mount: bool = arg(
+        default=False,
+        help="Read the live source PVC through its existing read-only HostPath mount; avoids a second CSI mount",
+    )
 
     async def run(self) -> None:
         request = build_copy_request(
@@ -208,6 +234,7 @@ class Copy(Command):
             port_forward_mode=self.port_forward_mode,
             create_pvc=self.create_pvc,
             storage_class=self.storage_class,
+            source_host_mount=self.source_host_mount,
         )
         if request.source.kind == "local" and not request.source.path.is_dir():
             raise ValueError(f"Source directory does not exist: {request.source.path}")
@@ -238,6 +265,7 @@ class Copy(Command):
             port_forward_mode=request.port_forward_mode,
             create_pvc=request.create_pvc,
             storage_class=request.storage_class,
+            source_host_mount=request.source_host_mount,
         )
         async with Spinner(
             title=f"Copying {format_endpoint(request.source)} → {format_endpoint(request.target)}",
@@ -340,10 +368,10 @@ class TakeoverPvc(Command):
     """Rebind a migrated PVC volume to the original PVC name."""
 
     source: str = arg(help="Migrated PVC root, e.g. pvc://media-migrated")
-    target: str = arg(help="Original PVC root name to take over, e.g. pvc://media")
+    target: str = arg(help="Original PVC root name to rebind, e.g. pvc://media")
     context: str | None = arg(default=None, help="Kubernetes context name")
     namespace: str | None = arg(default=None, help="Kubernetes namespace")
-    set_retain: bool = arg(default=False, help="Temporarily set PV reclaim policy to Retain during takeover")
+    set_retain: bool = arg(default=False, help="Temporarily set PV reclaim policy to Retain during rebind")
 
     async def run(self) -> None:
         request = build_takeover_request(
@@ -367,7 +395,7 @@ class TakeoverPvc(Command):
             set_retain=request.set_retain,
         )
         async with Spinner(
-            title=f"Taking over {format_endpoint(request.target)} with {format_endpoint(request.source)}",
+            title=f"Rebinding {format_endpoint(request.target)} with {format_endpoint(request.source)}",
             animation=Spin.DOTS,
             prefix=" ",
             suffix="...",
@@ -376,7 +404,132 @@ class TakeoverPvc(Command):
             session = run_takeover(request=request, kube=kube)
         console.print(
             "[green]"
-            f"PVC takeover complete: {format_endpoint(request.target)} now points to PV {session.pv_name}"
+            f"PVC rebind complete: {format_endpoint(request.target)} now points to PV {session.pv_name}"
+            "[/green]"
+        )
+
+
+class Move(Command):
+    """Copy a PVC to a migrated PVC and rebind the original name on success."""
+
+    source: str = arg(help="Original PVC root, e.g. pvc://media")
+    target: str = arg(help="Migrated PVC root, e.g. pvc://media-migrated")
+    context: str | None = arg(default=None, help="Kubernetes context name")
+    namespace: str | None = arg(default=None, help="Kubernetes namespace")
+    no_fzf: bool = arg(default=False, help="Disable interactive PVC selection")
+    set_retain: bool = arg(default=False, help="Temporarily set PV reclaim policy to Retain during rebind")
+    storage_class: str | None = arg(default=None, help="StorageClass for a newly created migrated PVC")
+
+    async def run(self) -> None:
+        request = build_move_request(
+            raw_source=self.source,
+            raw_target=self.target,
+            context_name=self.context,
+            namespace=self.namespace,
+            set_retain=self.set_retain,
+            storage_class=self.storage_class,
+        )
+
+        kube = KubeClient(context_name=request.context_name)
+        namespace = request.namespace or kube.current_namespace()
+        if not namespace:
+            raise ValueError("Namespace is required. Pass --namespace or configure one in kubeconfig.")
+
+        request = MoveRequest(
+            source=resolve_endpoint(
+                client=kube,
+                namespace=namespace,
+                endpoint=request.source,
+                interactive=not self.no_fzf,
+            ),
+            target=resolve_endpoint(
+                client=kube,
+                namespace=namespace,
+                endpoint=request.target,
+                interactive=not self.no_fzf,
+            ),
+            context_name=request.context_name,
+            namespace=namespace,
+            set_retain=request.set_retain,
+            storage_class=request.storage_class,
+        )
+        async with Spinner(
+            title=f"Moving {format_endpoint(request.source)} via {format_endpoint(request.target)}",
+            animation=Spin.DOTS,
+            prefix=" ",
+            suffix="...",
+            speed=1.2,
+        ):
+            session = run_move(
+                request=request,
+                kube=kube,
+                helper_image=settings.helper_image,
+                helper_mount_path=settings.helper_mount_path,
+                rsync_port=settings.helper_rsync_port,
+                pod_name_suffix=None,
+                on_pod_ready=lambda pod_name: print_copy_info(request.source, pod_name, request.target),
+                open_transport=lambda mode, namespace, pod_name, remote_port: open_transport_session(
+                    mode=mode,
+                    core_api=kube._core_api,
+                    kubectl_bin=settings.kubectl_bin,
+                    namespace=namespace,
+                    pod_name=pod_name,
+                    remote_port=remote_port,
+                ),
+                run_rsync=run_rsync_command,
+                rsync_bin=settings.rsync_bin,
+            )
+        console.print(
+            "[green]"
+            f"Move complete: copied {format_endpoint(request.source)} to {format_endpoint(request.target)} "
+            f"and rebound {format_endpoint(request.source)} to PV {session.rebind.pv_name}"
+            "[/green]"
+        )
+
+
+class Switch(Command):
+    """Final-sync a stopped PVC to a staged volume, then rebind the original claim name."""
+
+    source: str = arg(help="Original PVC root, e.g. pvc://media")
+    target: str = arg(help="Staged PVC root, e.g. pvc://media-migration-staging")
+    context: str | None = arg(default=None, help="Kubernetes context name")
+    namespace: str | None = arg(default=None, help="Kubernetes namespace")
+
+    async def run(self) -> None:
+        source = parse_endpoint(self.source)
+        target = parse_endpoint(self.target)
+        request = SwitchRequest(source=source, target=target, context_name=self.context, namespace=self.namespace)
+        kube = KubeClient(context_name=request.context_name)
+        namespace = request.namespace or kube.current_namespace()
+        if not namespace:
+            raise ValueError("Namespace is required. Pass --namespace or configure one in kubeconfig.")
+        request = SwitchRequest(
+            source=resolve_endpoint(kube, namespace, request.source, interactive=False),
+            target=resolve_endpoint(kube, namespace, request.target, interactive=False),
+            context_name=request.context_name,
+            namespace=namespace,
+        )
+        async with Spinner(
+            title=f"Final-syncing {format_endpoint(request.source)} to {format_endpoint(request.target)} and rebinding",
+            animation=Spin.DOTS,
+            prefix=" ",
+            suffix="...",
+            speed=1.2,
+        ):
+            session = run_switch(
+                request=request,
+                kube=kube,
+                helper_image=settings.helper_image,
+                helper_mount_path=settings.helper_mount_path,
+                rsync_port=settings.helper_rsync_port,
+                pod_name_suffix=None,
+                on_pod_ready=lambda pod_name: print_copy_info(request.source, pod_name, request.target),
+                rsync_bin=settings.rsync_bin,
+            )
+        console.print(
+            "[green]"
+            f"PVC switch complete: {format_endpoint(request.source)} now points to PV {session.pv_name}; "
+            "the original source PV remains Retain/Released"
             "[/green]"
         )
 
@@ -391,6 +544,21 @@ def main() -> None:
             if raw_args and not raw_args[0].startswith("-"):
                 raw_args = ["--target", raw_args[0], *raw_args[1:]]
             command = Debug.parse(raw_args)
+        elif len(sys.argv) > 1 and sys.argv[1] == "move":
+            raw_args = sys.argv[2:]
+            if len(raw_args) >= 2 and not raw_args[0].startswith("-") and not raw_args[1].startswith("-"):
+                raw_args = ["--source", raw_args[0], "--target", raw_args[1], *raw_args[2:]]
+            command = Move.parse(raw_args)
+        elif len(sys.argv) > 1 and sys.argv[1] == "switch":
+            raw_args = sys.argv[2:]
+            if len(raw_args) >= 2 and not raw_args[0].startswith("-") and not raw_args[1].startswith("-"):
+                raw_args = ["--source", raw_args[0], "--target", raw_args[1], *raw_args[2:]]
+            command = Switch.parse(raw_args)
+        elif len(sys.argv) > 1 and sys.argv[1] == "copy":
+            raw_args = sys.argv[2:]
+            if len(raw_args) >= 2 and not raw_args[0].startswith("-") and not raw_args[1].startswith("-"):
+                raw_args = ["--source", raw_args[0], "--target", raw_args[1], *raw_args[2:]]
+            command = Copy.parse(raw_args)
         elif len(sys.argv) > 1 and sys.argv[1] == "rebind-pvc":
             raw_args = sys.argv[2:]
             if len(raw_args) >= 2 and not raw_args[0].startswith("-") and not raw_args[1].startswith("-"):

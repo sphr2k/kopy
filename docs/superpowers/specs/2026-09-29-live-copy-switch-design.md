@@ -21,8 +21,9 @@ to node 1, so a final transfer must use separate source and destination pods.
    non-authoritative sync. The flag explicitly opts into reading the existing
    source mount through a read-only HostPath. It requires the source PVC to be
    mounted by exactly one active pod.
-2. The operator stops the workload through its normal control plane and waits
-   until no active pod references the source PVC.
+2. Stop the workload through its normal control plane, pause the controller
+   that owns the PVC so it cannot recreate the old claim, and delete every Pod
+   object referencing the source PVC, including completed Pods.
 3. `kopy switch pvc://SOURCE pvc://TARGET` performs an authoritative final
    `rsync --delete` from a source pod mounting the source PVC to a destination
    pod mounting the target PVC, then rebinds the target PV to the original PVC
@@ -52,8 +53,8 @@ releases the staging PVC and binds its PV under the source claim name.
 - `--source-host-mount` fails if it cannot identify one ready source pod and
   the source PV mount directory. It never falls back to mounting the live
   source PVC again.
-- `switch` fails before copying if an active pod still references the source
-  PVC, or if either PV is not `Retain`.
+- `switch` fails before copying if any pod object references the source PVC,
+  including completed pods, or if either PV is not `Retain`.
 - The source HostPath mount is read-only and points to one PV mount directory;
   its reader runs non-root. The destination rsync daemon retains Kopy's current
   ownership-preserving identity behavior, with privilege escalation disabled.

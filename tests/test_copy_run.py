@@ -3,14 +3,16 @@ from __future__ import annotations
 import contextlib
 from pathlib import Path
 
-from kopy.models import CopyRequest, Endpoint, TakeoverRequest
-from kopy.workflow import run_copy, run_takeover
+from kopy.models import CopyRequest, Endpoint, MoveRequest, TakeoverRequest
+from kopy.workflow import run_copy, run_move, run_takeover
 
 
 class FakeKubeClient:
     def __init__(self) -> None:
         self.created: list[tuple[str, dict]] = []
         self.deleted: list[tuple[str, str]] = []
+        self.waited_for_deleted_pvcs: list[tuple[str, str]] = []
+        self.waited_for_deleted_pvc_timeouts: list[int] = []
         self.exec_calls: list[tuple[str, str, str]] = []
         self.created_pvcs: list[tuple[str, dict]] = []
         self.pvcs: dict[tuple[str, str], dict] = {
@@ -36,10 +38,18 @@ class FakeKubeClient:
 
     def create_pvc(self, namespace: str, manifest: dict) -> None:
         self.created_pvcs.append((namespace, manifest))
+        spec = dict(manifest["spec"])
+        if "volumeName" not in spec:
+            generated_pv_name = f"pv-{manifest['metadata']['name']}"
+            spec["volumeName"] = generated_pv_name
+            self.pvs[generated_pv_name] = {
+                "metadata": {"name": generated_pv_name, "annotations": {}},
+                "spec": {"persistentVolumeReclaimPolicy": "Retain"},
+            }
         self.pvcs[(namespace, manifest["metadata"]["name"])] = {
             "metadata": {"name": manifest["metadata"]["name"]},
-            "spec": manifest["spec"],
-            "status": {"phase": "Pending"},
+            "spec": spec,
+            "status": {"phase": "Bound"},
         }
 
     def get_pv(self, pv_name: str) -> dict:
@@ -48,6 +58,10 @@ class FakeKubeClient:
     def delete_pvc(self, namespace: str, pvc_name: str) -> None:
         self.deleted_pvcs.append((namespace, pvc_name))
         self.pvcs.pop((namespace, pvc_name), None)
+
+    def wait_for_pvc_deleted(self, namespace: str, pvc_name: str, timeout_seconds: int = 30) -> None:
+        self.waited_for_deleted_pvcs.append((namespace, pvc_name))
+        self.waited_for_deleted_pvc_timeouts.append(timeout_seconds)
 
     def patch_pv(self, pv_name: str, body: dict) -> None:
         self.patched_pvs.append((pv_name, body))
@@ -455,6 +469,8 @@ def test_run_takeover_rebinds_migrated_volume_to_missing_original_name() -> None
     assert session.pvc_name == "media"
     assert session.pv_name == "pv-migrated"
     assert kube.deleted_pvcs == [("demo", "media-migrated")]
+    assert kube.waited_for_deleted_pvcs == [("demo", "media-migrated")]
+    assert kube.waited_for_deleted_pvc_timeouts == [60]
     assert kube.patched_pvs == [
         (
             "pv-migrated",
@@ -537,6 +553,8 @@ def test_run_takeover_deletes_existing_original_pvc_before_rebind() -> None:
 
     assert session.pvc_name == "media"
     assert kube.deleted_pvcs == [("demo", "media"), ("demo", "media-migrated")]
+    assert kube.waited_for_deleted_pvcs == [("demo", "media"), ("demo", "media-migrated")]
+    assert kube.waited_for_deleted_pvc_timeouts == [60, 60]
 
 
 def test_run_takeover_requires_retain_reclaim_policy() -> None:
@@ -651,3 +669,106 @@ def test_run_takeover_can_temporarily_set_and_restore_retain() -> None:
         ("pv-migrated", {"spec": {"persistentVolumeReclaimPolicy": "Delete"}}),
         ("pv-original", {"spec": {"persistentVolumeReclaimPolicy": "Recycle"}}),
     ]
+
+
+def test_run_move_copies_then_rebinds_on_success() -> None:
+    kube = FakeKubeClient()
+    kube.pvcs[("demo", "media")] = {
+        "metadata": {"name": "media"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "50Gi"}},
+            "storageClassName": "slow-hdd",
+            "volumeName": "pv-original",
+        },
+        "status": {"phase": "Bound"},
+    }
+    kube.pvs["pv-original"] = {
+        "metadata": {"name": "pv-original", "annotations": {}},
+        "spec": {"persistentVolumeReclaimPolicy": "Retain"},
+    }
+
+    session = run_move(
+        request=MoveRequest(
+            source=Endpoint(kind="pvc", resource_name="media", path=Path(".")),
+            target=Endpoint(kind="pvc", resource_name="media-migrated", path=Path(".")),
+            context_name="ctx",
+            namespace="demo",
+            set_retain=False,
+            storage_class="fast-ssd",
+        ),
+        kube=kube,
+        helper_image="ghcr.io/example/kopy-agent:latest",
+        helper_mount_path="/data",
+        rsync_port=1873,
+        pod_name_suffix="abcde",
+        on_pod_ready=None,
+        open_transport=FakeTransport().open,
+        run_rsync=lambda command: None,
+        rsync_bin="rsync",
+    )
+
+    assert session.target.resource_name == "media-migrated"
+    assert session.rebind.pvc_name == "media"
+    assert kube.created_pvcs[0] == (
+        "demo",
+        {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {"name": "media-migrated"},
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": {"requests": {"storage": "50Gi"}},
+                "storageClassName": "fast-ssd",
+            },
+        },
+    )
+    assert kube.deleted_pvcs == [("demo", "media"), ("demo", "media-migrated")]
+    assert kube.created_pvcs[-1][1]["metadata"]["name"] == "media"
+
+
+def test_run_move_skips_rebind_when_copy_fails() -> None:
+    class FailingCopyKube(FakeKubeClient):
+        def exec_in_pod(self, namespace: str, pod_name: str, command: list[str]) -> str:
+            if command and command[0] == "rsync":
+                raise RuntimeError("copy failed")
+            return super().exec_in_pod(namespace, pod_name, command)
+
+    kube = FailingCopyKube()
+    kube.pvcs[("demo", "media")] = {
+        "metadata": {"name": "media"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "50Gi"}},
+            "storageClassName": "slow-hdd",
+            "volumeName": "pv-original",
+        },
+        "status": {"phase": "Bound"},
+    }
+
+    try:
+        run_move(
+            request=MoveRequest(
+                source=Endpoint(kind="pvc", resource_name="media", path=Path(".")),
+                target=Endpoint(kind="pvc", resource_name="media-migrated", path=Path(".")),
+                context_name="ctx",
+                namespace="demo",
+                set_retain=False,
+                storage_class="fast-ssd",
+            ),
+            kube=kube,
+            helper_image="ghcr.io/example/kopy-agent:latest",
+            helper_mount_path="/data",
+            rsync_port=1873,
+            pod_name_suffix="abcde",
+            on_pod_ready=None,
+            open_transport=FakeTransport().open,
+            run_rsync=lambda command: None,
+            rsync_bin="rsync",
+        )
+    except RuntimeError as exc:
+        assert "copy failed" in str(exc)
+    else:
+        raise AssertionError("expected move copy phase to fail")
+
+    assert kube.deleted_pvcs == []

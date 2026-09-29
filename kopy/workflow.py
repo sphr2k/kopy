@@ -4,8 +4,16 @@ import random
 import string
 from pathlib import Path
 
-from .k8s import build_debug_pod_manifest, build_dual_pvc_pod_manifest, build_helper_pod_manifest, build_pvc_manifest
-from .models import CopyRequest, CopySession, DebugRequest, DebugSession, TakeoverRequest, TakeoverSession
+from .k8s import (
+    build_debug_pod_manifest,
+    build_dual_pvc_pod_manifest,
+    build_helper_pod_manifest,
+    build_hostpath_source_pod_manifest,
+    build_pvc_manifest,
+    build_rsync_service_manifest,
+    build_source_pvc_pod_manifest,
+)
+from .models import CopyRequest, CopySession, DebugRequest, DebugSession, MoveRequest, MoveSession, SwitchRequest, TakeoverRequest, TakeoverSession
 from .transport import build_rsync_command
 
 
@@ -184,7 +192,11 @@ def run_takeover(
     try:
         if target_pvc is not None:
             kube.delete_pvc(namespace, request.target.resource_name)  # type: ignore[attr-defined]
+            if hasattr(kube, "wait_for_pvc_deleted"):
+                kube.wait_for_pvc_deleted(namespace, request.target.resource_name, timeout_seconds=60)  # type: ignore[attr-defined]
         kube.delete_pvc(namespace, request.source.resource_name)  # type: ignore[attr-defined]
+        if hasattr(kube, "wait_for_pvc_deleted"):
+            kube.wait_for_pvc_deleted(namespace, request.source.resource_name, timeout_seconds=60)  # type: ignore[attr-defined]
         kube.patch_pv(  # type: ignore[attr-defined]
             source_pv_name,
             {
@@ -212,6 +224,272 @@ def run_takeover(
     finally:
         for pv_name, original_policy in patched_pvs:
             _update_reclaim_policy(kube, pv_name, original_policy)
+
+
+def run_move(
+    request: MoveRequest,
+    kube: object,
+    helper_image: str,
+    helper_mount_path: str,
+    rsync_port: int,
+    pod_name_suffix: str | None,
+    on_pod_ready: object | None,
+    open_transport: object,
+    run_rsync: object,
+    rsync_bin: str,
+) -> MoveSession:
+    namespace = request.namespace
+    if not namespace:
+        raise ValueError("Move request is missing a namespace")
+
+    _require_root_pvc_endpoint(request.source, "Source")
+    _require_root_pvc_endpoint(request.target, "Target")
+
+    copy_session = run_copy(
+        request=CopyRequest(
+            source=request.source,
+            target=request.target,
+            context_name=request.context_name,
+            namespace=namespace,
+            uid=None,
+            gid=None,
+            keep_pod=False,
+            port_forward_mode="auto",
+            create_pvc=True,
+            storage_class=request.storage_class,
+        ),
+        kube=kube,
+        helper_image=helper_image,
+        helper_mount_path=helper_mount_path,
+        rsync_port=rsync_port,
+        pod_name_suffix=pod_name_suffix,
+        on_pod_ready=on_pod_ready,
+        open_transport=open_transport,
+        run_rsync=run_rsync,
+        rsync_bin=rsync_bin,
+    )
+    rebind_session = run_takeover(
+        request=TakeoverRequest(
+            source=request.target,
+            target=request.source,
+            context_name=request.context_name,
+            namespace=namespace,
+            set_retain=request.set_retain,
+        ),
+        kube=kube,
+    )
+    return MoveSession(
+        source=request.source,
+        target=request.target,
+        copy=copy_session,
+        rebind=rebind_session,
+    )
+
+
+def _require_retain_pvs(kube: object, namespace: str, pvc_names: list[str]) -> dict[str, str]:
+    pv_names: dict[str, str] = {}
+    for pvc_name in pvc_names:
+        pvc = kube.get_pvc(namespace, pvc_name)  # type: ignore[attr-defined]
+        if pvc is None:
+            raise ValueError(f"PVC {namespace}/{pvc_name} does not exist")
+        pv_name = pvc.get("spec", {}).get("volumeName")
+        if not pv_name:
+            raise ValueError(f"PVC {namespace}/{pvc_name} is not bound to a PV")
+        pv = kube.get_pv(pv_name)  # type: ignore[attr-defined]
+        if pv.get("spec", {}).get("persistentVolumeReclaimPolicy") != "Retain":
+            raise ValueError(f"PV {pv_name} must use Retain reclaim policy before switch")
+        pv_names[pvc_name] = pv_name
+    return pv_names
+
+
+def run_switch(
+    request: SwitchRequest,
+    kube: object,
+    helper_image: str,
+    helper_mount_path: str,
+    rsync_port: int,
+    pod_name_suffix: str | None,
+    on_pod_ready: object | None,
+    rsync_bin: str,
+) -> TakeoverSession:
+    namespace = request.namespace
+    if not namespace:
+        raise ValueError("Switch request is missing a namespace")
+    _require_root_pvc_endpoint(request.source, "Source")
+    _require_root_pvc_endpoint(request.target, "Target")
+    if request.source.resource_name == request.target.resource_name:
+        raise ValueError("Source and target PVC names must be different")
+
+    source_name = request.source.resource_name
+    target_name = request.target.resource_name
+    source_consumers = kube.get_pvc_pod_references(namespace, source_name)  # type: ignore[attr-defined]
+    if source_consumers:
+        names = ", ".join(
+            f"{pod.get('metadata', {}).get('name', '<unknown>')} ({pod.get('status', {}).get('phase', 'unknown')})"
+            for pod in source_consumers
+        )
+        raise ValueError(f"Remove all pod objects referencing PVC {namespace}/{source_name} before switch: {names}")
+    pv_names = _require_retain_pvs(kube, namespace, [source_name, target_name])
+    target_node = kube.get_pvc_bound_node(namespace, target_name)  # type: ignore[attr-defined]
+    if not target_node:
+        raise ValueError("The target PV must have a resolvable node affinity before switch")
+
+    operation = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
+    source_pod = build_helper_pod_name("switch-source", source_name, suffix=operation)
+    target_pod = build_helper_pod_name("switch-target", target_name, suffix=operation)
+    service_name = build_helper_pod_name("switch-svc", target_name, suffix=operation)
+    selector = {"app.kubernetes.io/name": "kopy", "kopy.io/pod-name": target_pod}
+    service_created = False
+    source_created = False
+    target_created = False
+    try:
+        target_manifest = build_helper_pod_manifest(
+            pvc_endpoint=request.target,
+            pod_name=target_pod,
+            image=helper_image,
+            rsync_port=rsync_port,
+            mount_path=helper_mount_path,
+        )
+        kube.create_helper_pod(namespace, target_manifest)  # type: ignore[attr-defined]
+        target_created = True
+        kube.wait_for_pod_ready(namespace, target_pod, timeout_seconds=120)  # type: ignore[attr-defined]
+        kube.create_service(
+            namespace,
+            build_rsync_service_manifest(service_name, selector, rsync_port),
+        )  # type: ignore[attr-defined]
+        service_created = True
+        service_ip = kube.wait_for_service_ready(namespace, service_name, timeout_seconds=60)  # type: ignore[attr-defined]
+        source_manifest = build_source_pvc_pod_manifest(
+            pvc_name=source_name,
+            pod_name=source_pod,
+            image=helper_image,
+            mount_path=helper_mount_path,
+            node_name=None,
+            rsync_command=[
+                rsync_bin,
+                "-a",
+                "--delete",
+                "--numeric-ids",
+                f"{helper_mount_path}/",
+                f"rsync://{service_ip}:{rsync_port}/volume/",
+            ],
+        )
+        kube.create_helper_pod(namespace, source_manifest)  # type: ignore[attr-defined]
+        source_created = True
+        if on_pod_ready is not None:
+            on_pod_ready(source_pod)
+        kube.wait_for_pod_completed(namespace, source_pod, timeout_seconds=3600)  # type: ignore[attr-defined]
+    finally:
+        if service_created:
+            kube.delete_service(namespace, service_name)  # type: ignore[attr-defined]
+        if source_created:
+            kube.delete_pod(namespace, source_pod)  # type: ignore[attr-defined]
+            if hasattr(kube, "wait_for_pod_deleted"):
+                kube.wait_for_pod_deleted(namespace, source_pod, timeout_seconds=60)  # type: ignore[attr-defined]
+        if target_created:
+            kube.delete_pod(namespace, target_pod)  # type: ignore[attr-defined]
+            if hasattr(kube, "wait_for_pod_deleted"):
+                kube.wait_for_pod_deleted(namespace, target_pod, timeout_seconds=60)  # type: ignore[attr-defined]
+
+    # Recheck consumers and reclaim policy after helpers have unmounted both volumes.
+    if kube.get_pvc_pod_references(namespace, source_name):  # type: ignore[attr-defined]
+        raise ValueError(f"PVC {namespace}/{source_name} gained a pod consumer during switch; refusing rebind")
+    if _require_retain_pvs(kube, namespace, [source_name, target_name]) != pv_names:
+        raise ValueError("PVC-to-PV bindings changed during switch; refusing rebind")
+    return run_takeover(
+        TakeoverRequest(
+            source=request.target,
+            target=request.source,
+            context_name=request.context_name,
+            namespace=namespace,
+            set_retain=False,
+        ),
+        kube,
+    )
+
+
+def run_hostpath_copy(
+    request: CopyRequest,
+    kube: object,
+    helper_image: str,
+    mount_path: str,
+    rsync_port: int,
+    rsync_bin: str,
+) -> CopySession:
+    namespace = request.namespace
+    if not namespace:
+        raise ValueError("Copy request is missing a namespace")
+    _require_root_pvc_endpoint(request.source, "Source")
+    _require_root_pvc_endpoint(request.target, "Target")
+    source = kube.get_pvc_mount_source(namespace, request.source.resource_name)  # type: ignore[attr-defined]
+    source_name = request.source.resource_name
+    target_name = request.target.resource_name
+    operation = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
+    target_pod = build_helper_pod_name("copy-target", target_name, suffix=operation)
+    source_pod = build_helper_pod_name("copy-source", source_name, suffix=operation)
+    service_name = build_helper_pod_name("copy-svc", target_name, suffix=operation)
+    selector = {"app.kubernetes.io/name": "kopy", "kopy.io/pod-name": target_pod}
+    source_created = False
+    target_created = False
+    service_created = False
+    try:
+        target_manifest = build_helper_pod_manifest(
+            pvc_endpoint=request.target,
+            pod_name=target_pod,
+            image=helper_image,
+            rsync_port=rsync_port,
+            mount_path=mount_path,
+        )
+        kube.create_helper_pod(namespace, target_manifest)  # type: ignore[attr-defined]
+        target_created = True
+        kube.wait_for_pod_ready(namespace, target_pod, timeout_seconds=120)  # type: ignore[attr-defined]
+        kube.create_service(
+            namespace,
+            build_rsync_service_manifest(service_name, selector, rsync_port),
+        )  # type: ignore[attr-defined]
+        service_created = True
+        service_ip = kube.wait_for_service_ready(namespace, service_name, timeout_seconds=60)  # type: ignore[attr-defined]
+        command = [
+            rsync_bin,
+            "-a",
+            "--numeric-ids",
+            f"{mount_path}/",
+            f"rsync://{service_ip}:{rsync_port}/volume/",
+        ]
+        source_manifest = build_hostpath_source_pod_manifest(
+            pod_name=source_pod,
+            image=helper_image,
+            host_path=source["host_path"],
+            mount_path=mount_path,
+            node_name=source["node_name"],
+            rsync_command=command,
+        )
+        kube.create_helper_pod(namespace, source_manifest)  # type: ignore[attr-defined]
+        source_created = True
+        kube.wait_for_pod_completed(namespace, source_pod, timeout_seconds=3600)  # type: ignore[attr-defined]
+        after = kube.get_pvc_mount_source(namespace, source_name)  # type: ignore[attr-defined]
+        if after["pod_uid"] != source["pod_uid"]:
+            raise RuntimeError("Source workload pod changed during warm copy; refusing to report a consistent copy")
+        return CopySession(
+            pod_name=source_pod,
+            namespace=namespace,
+            local_port=None,
+            rsync_port=rsync_port,
+            detected_uid=None,
+            detected_gid=None,
+            transport="clusterip-hostpath",
+        )
+    finally:
+        if service_created:
+            kube.delete_service(namespace, service_name)  # type: ignore[attr-defined]
+        if source_created:
+            kube.delete_pod(namespace, source_pod)  # type: ignore[attr-defined]
+            if hasattr(kube, "wait_for_pod_deleted"):
+                kube.wait_for_pod_deleted(namespace, source_pod, timeout_seconds=60)  # type: ignore[attr-defined]
+        if target_created:
+            kube.delete_pod(namespace, target_pod)  # type: ignore[attr-defined]
+            if hasattr(kube, "wait_for_pod_deleted"):
+                kube.wait_for_pod_deleted(namespace, target_pod, timeout_seconds=60)  # type: ignore[attr-defined]
 
 
 def _run_pvc_to_pvc(
@@ -293,10 +571,22 @@ def run_copy(
     if source.kind == "local" and target.kind == "local":
         raise ValueError("Both endpoints are local — use cp or rsync directly")
 
+    if request.source_host_mount and (source.kind != "pvc" or target.kind != "pvc"):
+        raise ValueError("--source-host-mount requires both source and target to be PVC endpoints")
+
     if target.kind == "pvc":
         ensure_target_pvc(request, kube)
 
     if source.kind == "pvc" and target.kind == "pvc":
+        if request.source_host_mount:
+            return run_hostpath_copy(
+                request=request,
+                kube=kube,
+                helper_image=helper_image,
+                mount_path=helper_mount_path,
+                rsync_port=rsync_port,
+                rsync_bin=rsync_bin,
+            )
         return _run_pvc_to_pvc(
             request=request,
             kube=kube,
